@@ -28,10 +28,10 @@ from visualize.visualize_cfpu_input import load_cfpu
 def main():
     """使用生成的CFPU输入文件进行重建尝试"""
     # 输入目录（使用我们生成的CFPU输入数据）
-    input_dir = r"output\cfpu_input\leftGear_surface_cellnormals_cfpu_input"
+    input_dir = r"output\cfpu_input\Ring_surface_cellnormals_cfpu_input"
     
-    # 输出目录
-    output_dir = r"output\leftGear_surface_cellnormals_cfpu_recon_new"
+    # 输出目录（将重建结果保存到这里）
+    output_dir = r"output\Ring_recon"
     os.makedirs(output_dir, exist_ok=True)
     
     print("读取CFPU输入文件...")
@@ -56,7 +56,7 @@ def main():
         return 1
     
     # 根据用户要求，设置网格大小为128
-    gridsize = 512  # 用户要求的网格大小
+    gridsize = 64  # 用户要求的网格大小
     
     print(f"\n开始CFPU重建，网格大小: {gridsize}...")
     print(f"使用GPU加速: {GPU_AVAILABLE}")

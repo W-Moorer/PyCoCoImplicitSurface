@@ -29,9 +29,16 @@ def main():
     inputs = args.inputs
     if not inputs:
         inputs = [
-            os.path.join('input', 'leftGear_surface_cellnormals.vtp'),
-            os.path.join('input', 'coarse_cylinder_surface_cellnormals.vtp'),
-            os.path.join('input', 'zuheti_surface_cellnormals.vtp'),
+            os.path.join('input', 'smooth_geometry', 'Ellipsoid_surface_cellnormals.vtp'),
+            os.path.join('input', 'smooth_geometry', 'Ring_surface_cellnormals.vtp'),
+            os.path.join('input', 'smooth_geometry', 'Sphere_surface_cellnormals.vtp'),
+            os.path.join('input', 'nonsmooth_geometry', 'Cone_surface_cellnormals.vtp'),
+            os.path.join('input', 'nonsmooth_geometry', 'Cylinder_surface_cellnormals.vtp'),
+            os.path.join('input', 'nonsmooth_geometry', 'Cube_surface_cellnormals.vtp'),
+            os.path.join('input', 'nonsmooth_geometry', 'Prism_surface_cellnormals.vtp'),
+            os.path.join('input', 'nonsmooth_geometry', 'TruncatedRing_surface_cellnormals.vtp'),
+            os.path.join('input', 'combinatorial_geometry', 'CompositeBody1_surface_cellnormals.vtp'),
+            os.path.join('input', 'combinatorial_geometry', 'CompositeBody2_surface_cellnormals.vtp')
         ]
     build_cfpu_input = _get_builder()
     for inp in inputs:

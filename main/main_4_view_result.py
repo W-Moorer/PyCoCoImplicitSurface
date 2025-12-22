@@ -14,11 +14,11 @@ import argparse
 
 def main():
     """
-    可视化CFPU重建结果，提供四个不同角度的视图
+    可视化CFPU重建结果
     """
     ap = argparse.ArgumentParser()
     ap.add_argument('--recon_dir', type=str, 
-                   default='output/leftGear_surface_cellnormals_cfpu_recon_new',
+                   default='output/Ring_recon',
                    help='CFPU重建结果输出目录')
     ap.add_argument('--window_size', type=int, nargs=2, default=[1600, 1200],
                    help='可视化窗口大小 (width height)')
