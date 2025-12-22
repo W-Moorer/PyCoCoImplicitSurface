@@ -56,7 +56,7 @@ def main():
         return 1
     
     # 根据用户要求，设置网格大小为128
-    gridsize = 256  # 用户要求的网格大小
+    gridsize = 512  # 用户要求的网格大小
     
     print(f"\n开始CFPU重建，网格大小: {gridsize}...")
     print(f"使用GPU加速: {GPU_AVAILABLE}")
