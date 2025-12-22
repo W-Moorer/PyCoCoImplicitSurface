@@ -361,7 +361,26 @@ def configure_patch_radii(x, y, delta=1.0, patchRad=None, feature_mask=None, fea
         missingIds = np.where(~nodeInPatch)[0]
     return idx, nn_dist_list, patchRad
 
-def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, progress=None, progress_stage=None):
+
+def load_patch_radii_txt(radii_path, *, expected_len=None):
+    """从radii.txt读取每个patch的半径。
+
+    参数:
+        radii_path: radii.txt路径
+        expected_len: 若给定，则检查长度是否与patch数量一致
+
+    返回:
+        radii: shape (M,) 的 float 数组
+    """
+    if radii_path is None:
+        raise ValueError('radii_path is None')
+    radii = np.loadtxt(radii_path, dtype=float)
+    radii = np.asarray(radii, dtype=float).reshape(-1)
+    if expected_len is not None and radii.shape[0] != int(expected_len):
+        raise ValueError(f"radii长度({radii.shape[0]})与expected_len({int(expected_len)})不一致: {radii_path}")
+    return radii
+
+def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, progress=None, progress_stage=None, patch_radii=None, patch_radii_file=None, patch_radii_in_world_units=True, patch_radii_enforce_coverage=True, feature_mask=None, feature_scale=1.0):
     if kernelinfo is None:
         kernelinfo = {
             'phi': lambda r: -r,
@@ -380,38 +399,82 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
     y = y / scale
     M = y.shape[0]
     N = x.shape[0]
-    tree_y = cKDTree(y)
-    nn_dist = tree_y.query(y, k=2)[0][:, 1]
-    H = np.max(nn_dist)
     delta = 1.0
-    patchRad0 = (1.0 + delta) * H / 2.0
-    tree_x = cKDTree(x)
-    idx = []
-    nn_dist_list = []
-    for k in range(M):
-        id_list = tree_x.query_ball_point(y[k, :], patchRad0)
-        idx.append(np.array(id_list, dtype=int))
-        if len(id_list) == 0:
-            nn_dist_list.append(np.array([], dtype=float))
-        else:
-            dists = np.linalg.norm(x[id_list, :] - y[k, :], axis=1)
-            nn_dist_list.append(dists)
-    patchRad = np.full(M, patchRad0)
-    nodeInPatch = np.zeros(N, dtype=bool)
-    for k in range(M):
-        nodeInPatch[idx[k]] = True
-    missingIds = np.where(~nodeInPatch)[0]
-    while missingIds.size > 0:
-        cp_id = tree_y.query(x[missingIds[0], :], k=1)[1]
-        p_dist = tree_y.query(x[missingIds[0], :], k=1)[0]
-        temp_rad = 1.01 * p_dist
-        id_list = tree_x.query_ball_point(y[cp_id, :], temp_rad)
-        dists = np.linalg.norm(x[id_list, :] - y[cp_id, :], axis=1)
-        idx[cp_id] = np.array(id_list, dtype=int)
-        nn_dist_list[cp_id] = dists
-        patchRad[cp_id] = temp_rad
-        nodeInPatch[id_list] = True
+
+    # -------- Patch 半径/覆盖策略（支持读取 radii.txt） --------
+    # 说明：cfpurecon内部会把x/y缩放到单位盒；若radii来自precompute输出（世界坐标），需要按同样scale缩放。
+    if patch_radii is None and patch_radii_file is not None:
+        patch_radii = load_patch_radii_txt(patch_radii_file, expected_len=M)
+
+    if patch_radii is None:
+        # 原始逻辑：统一初值 + 漏点补覆盖（保持原始行为，方便A/B对比）
+        tree_y = cKDTree(y)
+        nn_dist = tree_y.query(y, k=2)[0][:, 1]
+        H = np.max(nn_dist) if nn_dist.size else 0.0
+        patchRad0 = (1.0 + delta) * H / 2.0
+        tree_x = cKDTree(x)
+        idx = []
+        nn_dist_list = []
+        for k in range(M):
+            id_list = tree_x.query_ball_point(y[k, :], patchRad0)
+            idx.append(np.array(id_list, dtype=int))
+            if len(id_list) == 0:
+                nn_dist_list.append(np.array([], dtype=float))
+            else:
+                dists = np.linalg.norm(x[id_list, :] - y[k, :], axis=1)
+                nn_dist_list.append(dists)
+        patchRad = np.full(M, patchRad0, dtype=float)
+        nodeInPatch = np.zeros(N, dtype=bool)
+        for k in range(M):
+            nodeInPatch[idx[k]] = True
         missingIds = np.where(~nodeInPatch)[0]
+        while missingIds.size > 0:
+            cp_id = tree_y.query(x[missingIds[0], :], k=1)[1]
+            p_dist = tree_y.query(x[missingIds[0], :], k=1)[0]
+            temp_rad = 1.01 * float(p_dist)
+            id_list = tree_x.query_ball_point(y[cp_id, :], temp_rad)
+            dists = np.linalg.norm(x[id_list, :] - y[cp_id, :], axis=1) if len(id_list) else np.array([], dtype=float)
+            idx[cp_id] = np.array(id_list, dtype=int)
+            nn_dist_list[cp_id] = dists
+            patchRad[cp_id] = temp_rad
+            nodeInPatch[id_list] = True
+            missingIds = np.where(~nodeInPatch)[0]
+    else:
+        # 使用外部半径（数组或文件）
+        patch_radii_arr = np.asarray(patch_radii, dtype=float).reshape(-1)
+        if patch_radii_arr.size == 1:
+            patch_radii_arr = np.full(M, float(patch_radii_arr[0]), dtype=float)
+        if patch_radii_arr.shape[0] != M:
+            raise ValueError(f"patch_radii长度({patch_radii_arr.shape[0]})与patch数量M({M})不一致")
+        if patch_radii_in_world_units:
+            if scale == 0:
+                raise ValueError('点云尺度(scale)为0，无法缩放radii')
+            patch_radii_arr = patch_radii_arr / scale
+        patch_radii_arr = np.maximum(patch_radii_arr, 1e-12)
+
+        if patch_radii_enforce_coverage:
+            # 仍然执行一次“漏点补覆盖”，避免radii文件有疏漏导致NaN
+            idx, nn_dist_list, patchRad = configure_patch_radii(
+                x, y, delta=delta, patchRad=patch_radii_arr,
+                feature_mask=feature_mask, feature_scale=feature_scale
+            )
+        else:
+            # 严格按给定半径建patch，不做任何半径修改（方便做A/B对比）
+            if feature_mask is not None:
+                fm = np.asarray(feature_mask, dtype=bool)[:M]
+                patch_radii_arr[fm] = patch_radii_arr[fm] * float(feature_scale)
+            tree_x = cKDTree(x)
+            idx = []
+            nn_dist_list = []
+            for k in range(M):
+                id_list = tree_x.query_ball_point(y[k, :], patch_radii_arr[k])
+                idx.append(np.array(id_list, dtype=int))
+                if len(id_list) == 0:
+                    nn_dist_list.append(np.array([], dtype=float))
+                else:
+                    dists = np.linalg.norm(x[id_list, :] - y[k, :], axis=1)
+                    nn_dist_list.append(dists)
+            patchRad = patch_radii_arr
     exactinterp = reginfo.get('exactinterp', 1)
     nrmlreg = reginfo.get('nrmlreg', 0)
     nrmllambda = reginfo.get('nrmllambda', 0)
@@ -741,6 +804,7 @@ __all__ = [
     'cfpurecon',
     '_init_proc',
     '_compute_proc',
+    'load_patch_radii_txt',
 ]
 
 

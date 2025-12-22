@@ -16,10 +16,10 @@ def main():
     """
     ap = argparse.ArgumentParser()
     ap.add_argument('--input_mesh', type=str, 
-                   default='input/zuheti_surface_cellnormals.vtp',
+                   default='input/leftGear_surface_cellnormals.vtp',
                    help='原始三角网格模型文件')
     ap.add_argument('--recon_dir', type=str, 
-                   default='output/zuheti_surface_cellnormals_cfpu_recon',
+                   default='output/leftGear_surface_cellnormals_cfpu_recon_new',
                    help='CFPU重建结果输出目录')
     args = ap.parse_args()
     

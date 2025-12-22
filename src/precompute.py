@@ -1275,7 +1275,7 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
     # 8. 半径重新划分：拓扑自适应初值 + 兜底
     radii = np.zeros(patches.shape[0], dtype=float)
     if patches.shape[0] > 0:
-        delta = 0.2  # 经验值
+        delta = 0.6  # 经验值
         n_min = 40   # 工程建议的n_min值
         k_neighbor = 25  # 经验值，20~30
         
