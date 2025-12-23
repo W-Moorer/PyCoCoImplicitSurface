@@ -24,8 +24,8 @@ except Exception as e:
 
 
 # ==================== 参数（按需改） ====================
-RECON_DIR = "./output/leftGear_surface_cellnormals_cfpu_recon_new"     # 含 potential.npy, grid.npz
-ORIGINAL_MESH_PATH = "./input/leftGear_surface_cellnormals.vtp"        # 原始网格（用其点/法向）
+RECON_DIR = "./output/Gear_recon_GPU"     # 含 potential.npy, grid.npz
+ORIGINAL_MESH_PATH = "./input/complex_geometry/Gear_surface_cellnormals.vtp"        # 原始网格（用其点/法向）
 ISO_VALUE = 0.0                                                       # 隐式面：phi=ISO_VALUE
 
 # 若你要用“采样点云”评估，把它设为路径；否则设为 None

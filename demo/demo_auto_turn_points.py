@@ -16,13 +16,13 @@ from src.precompute import read_mesh, detect_sharp_edges, detect_sharp_junctions
 
 def main():
     # 输入文件路径
-    input_path = r"input\zuheti_surface_cellnormals.vtp"
+    input_path = r"input\complex_geometry\PressureLubricatedCam_surface_cellnormals.vtp"
     
     # 输出目录
-    output_dir = r"output\zuheti_surface_cellnormals"
+    output_dir = r"output\auto_turn_points\complex_geometry\PressureLubricatedCam_surface_cellnormals"
     
     # 参数设置
-    angle_threshold = 30.0
+    angle_threshold = 45.0
     edge_split_threshold = None
     require_step_face_id_diff = False
     angle_turn_threshold = 90.0  # 间断点角度阈值
@@ -89,7 +89,10 @@ def main():
     sharp_edges_pkl = os.path.join(output_dir, "zuheti_surface_cellnormals_segmented_sharp_edges.pkl")
     
     # 使用系统命令运行可视化脚本
-    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --sharp_edges_pkl {sharp_edges_pkl} --segments_debug {segments_debug_path} --off_screen --screenshot {screenshot_path}"
+    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --angle_threshold {angle_threshold} --sharp_edges_pkl {sharp_edges_pkl} --segments_debug {segments_debug_path} --off_screen --screenshot {screenshot_path}"
+    os.system(cmd)
+
+    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --angle_threshold {angle_threshold} --sharp_edges_pkl {sharp_edges_pkl} --segments_debug {segments_debug_path}"
     os.system(cmd)
     
     print("\n自动化处理完成！")

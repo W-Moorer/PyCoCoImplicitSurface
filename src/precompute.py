@@ -1149,95 +1149,259 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
         else:
             normals[pid] = np.array([0, 0, 1])
     
-    # 5. 尖锐边法向量分离：处理具有多个法向量的节点
-    # 5.1 识别具有多个法向量的尖锐边节点
-    # 只有尖锐边上的节点才需要拆分（根据用户要求）
-    nodes_with_multiple_normals = set()
+    # # 5. 尖锐边法向量分离：处理具有多个法向量的节点
+    # # 5.1 识别具有多个法向量的尖锐边节点
+    # # 只有尖锐边上的节点才需要拆分（根据用户要求）
+    # nodes_with_multiple_normals = set()
     
-    # 5.2 收集每个尖锐边节点的所有法向量
-    node_to_normals = {}
-    for pid in sharp_vertex_ids:  # 只处理尖锐边上的节点
+    # # 5.2 收集每个尖锐边节点的所有法向量
+    # node_to_normals = {}
+    # for pid in sharp_vertex_ids:  # 只处理尖锐边上的节点
+    #     fl = p2f.get(pid, [])
+    #     if len(fl) > 1:
+    #         # 获取相邻面的法向量
+    #         face_normals = cell_normals[fl]
+            
+    #         # 去重法向量（使用小容差）
+    #         unique_normals = []
+    #         for fn in face_normals:
+    #             is_unique = True
+    #             for un in unique_normals:
+    #                 if np.linalg.norm(fn - un) < 1e-5:
+    #                     is_unique = False
+    #                     break
+    #             if is_unique:
+    #                 unique_normals.append(fn)
+            
+    #         if len(unique_normals) >= 2:
+    #             # 这个尖锐边节点具有多个法向量，需要处理
+    #             nodes_with_multiple_normals.add(pid)
+    #             node_to_normals[pid] = unique_normals
+    
+    # print(f"检测到具有多个法向量的尖锐边节点数量: {len(nodes_with_multiple_normals)}")
+    
+    # # 5.3 面内偏移拆分：对具有多个法向量的节点，按每个所属面片生成一个偏移节点
+    # new_nodes = []
+    # new_normals = []
+    
+    # # 计算面片质心
+    # face_centroids = []
+    # for fid in range(faces.shape[0]):
+    #     tri = faces[fid]
+    #     centroid = np.mean(points[tri], axis=0)
+    #     face_centroids.append(centroid)
+    # face_centroids = np.array(face_centroids)
+    
+    # # 计算偏移比例（根据模型尺寸自适应）
+    # bbox_diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+    # abs_inset = 1e-5      # 你期望的固定偏移（单位=模型单位，比如 m）
+    # rel_inset = 0.002     # 你说的小模型用的比例（0.2% 对角线）
+    # inset_dist = min(abs_inset, rel_inset * bbox_diag)
+    
+    # # 5.4 生成新的偏移节点
+    # for pid in range(points.shape[0]):
+    #     if pid in nodes_with_multiple_normals:
+    #         # 这个节点具有多个法向量，需要按每个面片生成偏移节点
+    #         v = points[pid]
+    #         fl = p2f.get(pid, [])
+            
+    #         for fid in fl:
+    #             # 获取该节点在当前面片中的位置
+    #             tri = faces[fid]
+    #             li = int(np.where(tri == pid)[0][0])  # 局部顶点索引
+                
+    #             # 计算从顶点向质心的偏移
+    #             c = face_centroids[fid]
+    #             d = c - v
+    #             L = np.linalg.norm(d)
+    #             if L < 1e-12:
+    #                 continue
+                
+    #             # 计算偏移系数，确保偏移距离合理且新节点在三角形内部
+    #             alpha = min(0.33, inset_dist / L)
+    #             p_in = v + alpha * d  # 凸组合，确保在三角形内部
+                
+    #             # 获取当前面片的法向量作为新节点的法向量
+    #             n = cell_normals[fid]
+                
+    #             # 添加到新节点和法向量列表
+    #             new_nodes.append(p_in)
+    #             new_normals.append(n)
+    #     else:
+    #         # 这个节点只有一个法向量，直接使用原始节点
+    #         new_nodes.append(points[pid])
+    #         new_normals.append(normals[pid])
+    
+    # # 转换为numpy数组
+    # new_nodes = np.array(new_nodes)
+    # new_normals = np.array(new_normals)
+
+    
+    # 5. 尖锐边法向量分离（方案1）：只在尖锐边点上拆分，且按“尖锐边切断的一环面连通分量(面簇)”拆分
+    #    —— 每个面簇生成 1 个节点 + 1 个法向（不再按每个面生成节点）
+
+    # 5.0 准备：尖锐边集合（用几何点id构成key，避免 split 后点id不一致）
+    sharp_geo_edges = set()
+    for e in sharp_edges:
+        gA = int(e.get('geo_point1_idx', inv[int(e['point1_idx'])]))
+        gB = int(e.get('geo_point2_idx', inv[int(e['point2_idx'])]))
+        if gA == gB:
+            continue
+        sharp_geo_edges.add((gA, gB) if gA < gB else (gB, gA))
+
+    # 5.0.1 工具函数
+    def _normalize(v):
+        n = float(np.linalg.norm(v))
+        return v / max(n, 1e-12)
+
+    def _tri_area(fid):
+        a, b, c = faces[int(fid)]
+        v0, v1, v2 = points[int(a)], points[int(b)], points[int(c)]
+        return 0.5 * float(np.linalg.norm(np.cross(v1 - v0, v2 - v0)))
+
+    # 参考你给的 test_separate.py：将“其他法向合力”投影到当前法向切平面，取反方向作为分离方向
+    # （只用于决定偏移方向，不用于分组）
+    def _separate_dir_from_normals(n_target, n_others):
+        n1 = _normalize(n_target)
+        if not n_others:
+            return np.zeros(3, dtype=float)
+        n_sum = np.sum(np.asarray(n_others, dtype=float), axis=0)
+        v_proj = n_sum - float(np.dot(n_sum, n1)) * n1
+        if float(np.linalg.norm(v_proj)) < 1e-12:
+            return np.zeros(3, dtype=float)
+        return _normalize(-v_proj)
+
+    # 5.1 计算偏移距离（你现在的“固定优先，小模型比例”的规则保留）
+    bbox_diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+    abs_inset = 1e-4
+    rel_inset = 1e-4
+    inset_dist = min(abs_inset, rel_inset * bbox_diag)
+    print(f"偏移距离: {inset_dist}")
+
+    # 5.2 预计算面片质心（用于兜底方向/轻微向内移动）
+    face_centroids = np.mean(points[faces], axis=1)  # (n_faces, 3)
+
+    # 5.3 对每个“尖锐边上的点 pid”，用尖锐边切断一环面，得到面簇（连通分量）
+    #     两个面在 pid 处可连通 <=> 它们共享的边 (pid, q) 不是尖锐边
+    from collections import defaultdict
+
+    pid_to_face_groups = {}     # pid -> [ [fid...], [fid...], ... ]
+    pid_to_group_normals = {}   # pid -> [n0, n1, ...]
+    split_pids = set()
+
+    for pid in sharp_vertex_ids:
         fl = p2f.get(pid, [])
-        if len(fl) > 1:
-            # 获取相邻面的法向量
-            face_normals = cell_normals[fl]
-            
-            # 去重法向量（使用小容差）
-            unique_normals = []
-            for fn in face_normals:
-                is_unique = True
-                for un in unique_normals:
-                    if np.linalg.norm(fn - un) < 1e-5:
-                        is_unique = False
-                        break
-                if is_unique:
-                    unique_normals.append(fn)
-            
-            if len(unique_normals) >= 2:
-                # 这个尖锐边节点具有多个法向量，需要处理
-                nodes_with_multiple_normals.add(pid)
-                node_to_normals[pid] = unique_normals
-    
-    print(f"检测到具有多个法向量的尖锐边节点数量: {len(nodes_with_multiple_normals)}")
-    
-    # 5.3 面内偏移拆分：对具有多个法向量的节点，按每个所属面片生成一个偏移节点
+        if len(fl) <= 1:
+            continue
+
+        gpid = int(inv[int(pid)])
+
+        # 建 edge -> faces 映射（只看经过 pid 的两条边）
+        edge2faces = defaultdict(list)
+        for fid in fl:
+            tri = faces[int(fid)]
+            # tri 中除 pid 外的两个点
+            for q in tri:
+                q = int(q)
+                if q == int(pid):
+                    continue
+                gq = int(inv[q])
+                key = (gpid, gq) if gpid < gq else (gq, gpid)
+                edge2faces[key].append(int(fid))
+
+        # union-find 在 fl 上做连通分量
+        parent = {int(fid): int(fid) for fid in fl}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a, b):
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+        # 共享同一条“非尖锐边”的 face union 在一起
+        for edge_key, fids in edge2faces.items():
+            if edge_key in sharp_geo_edges:
+                continue  # 尖锐边：切断
+            if len(fids) >= 2:
+                base = fids[0]
+                for other in fids[1:]:
+                    union(base, other)
+
+        groups = defaultdict(list)
+        for fid in fl:
+            groups[find(int(fid))].append(int(fid))
+
+        # 只有真的被“尖锐边切开”成 >=2 个面簇才拆分
+        if len(groups) >= 2:
+            split_pids.add(int(pid))
+            face_groups = list(groups.values())
+            pid_to_face_groups[int(pid)] = face_groups
+
+            # 每个面簇算一个“簇法向”（建议面积加权）
+            g_normals = []
+            for g in face_groups:
+                nsum = np.zeros(3, dtype=float)
+                wsum = 0.0
+                for fid in g:
+                    w = _tri_area(fid)
+                    nsum += w * cell_normals[int(fid)]
+                    wsum += w
+                if wsum < 1e-12:
+                    n = _normalize(np.mean(cell_normals[np.array(g, dtype=int)], axis=0))
+                else:
+                    n = _normalize(nsum)
+                g_normals.append(n)
+            pid_to_group_normals[int(pid)] = g_normals
+
+    print(f"检测到需要拆分的尖锐边节点数量(按面簇): {len(split_pids)}")
+
+    # 5.4 生成新的偏移节点：每个面簇 1 个节点（不再按每个面生成）
     new_nodes = []
     new_normals = []
-    
-    # 计算面片质心
-    face_centroids = []
-    for fid in range(faces.shape[0]):
-        tri = faces[fid]
-        centroid = np.mean(points[tri], axis=0)
-        face_centroids.append(centroid)
-    face_centroids = np.array(face_centroids)
-    
-    # 计算偏移比例（根据模型尺寸自适应）
-    bbox_diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
-    inset_scale = 0.02  # 偏移比例，可调整
-    inset_dist = inset_scale * bbox_diag
-    
-    # 5.4 生成新的偏移节点
+
     for pid in range(points.shape[0]):
-        if pid in nodes_with_multiple_normals:
-            # 这个节点具有多个法向量，需要按每个面片生成偏移节点
-            v = points[pid]
-            fl = p2f.get(pid, [])
-            
-            for fid in fl:
-                # 获取该节点在当前面片中的位置
-                tri = faces[fid]
-                li = int(np.where(tri == pid)[0][0])  # 局部顶点索引
-                
-                # 计算从顶点向质心的偏移
-                c = face_centroids[fid]
-                d = c - v
-                L = np.linalg.norm(d)
-                if L < 1e-12:
-                    continue
-                
-                # 计算偏移系数，确保偏移距离合理且新节点在三角形内部
-                alpha = min(0.33, inset_dist / L)
-                p_in = v + alpha * d  # 凸组合，确保在三角形内部
-                
-                # 获取当前面片的法向量作为新节点的法向量
-                n = cell_normals[fid]
-                
-                # 添加到新节点和法向量列表
-                new_nodes.append(p_in)
-                new_normals.append(n)
-        else:
-            # 这个节点只有一个法向量，直接使用原始节点
+        if pid not in split_pids:
             new_nodes.append(points[pid])
             new_normals.append(normals[pid])
-    
-    # 转换为numpy数组
-    new_nodes = np.array(new_nodes)
-    new_normals = np.array(new_normals)
-    
+            continue
+
+        v = points[pid]
+        face_groups = pid_to_face_groups[pid]
+        group_normals = pid_to_group_normals[pid]
+        K = len(face_groups)
+
+        for i in range(K):
+            n_i = group_normals[i]
+            others = [group_normals[j] for j in range(K) if j != i]
+
+            # 优先用“切平面投影分离方向”（来自你的参考逻辑）
+            d = _separate_dir_from_normals(n_i, others)
+
+            # 兜底：如果分离方向退化，用“指向本组面簇质心方向”并投影到切平面
+            if float(np.linalg.norm(d)) < 1e-12:
+                cg = np.mean(face_centroids[np.array(face_groups[i], dtype=int)], axis=0)
+                t = cg - v
+                t = t - float(np.dot(t, n_i)) * n_i  # 投影到切平面
+                if float(np.linalg.norm(t)) < 1e-12:
+                    d = np.array([1.0, 0.0, 0.0], dtype=float)  # 最后兜底
+                else:
+                    d = _normalize(t)
+
+            p_new = v + inset_dist * d
+            new_nodes.append(p_new)
+            new_normals.append(n_i)
+
+    new_nodes = np.asarray(new_nodes, dtype=float)
+    new_normals = np.asarray(new_normals, dtype=float)
+
     print(f"原始节点数量: {points.shape[0]}")
     print(f"新节点数量: {new_nodes.shape[0]}")
-    
+
     # 6. 更新nodes和normals为新生成的节点和法向量
     nodes = new_nodes
     normals = new_normals

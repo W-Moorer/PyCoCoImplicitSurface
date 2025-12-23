@@ -74,6 +74,53 @@ def curlfree_poly(x, l):
         return CP, P
     raise ValueError('Degree not implemented')
 
+
+# ===== GPU/NumPy 通用的多项式基（只返回 P；GPU 路径不需要 CP） =====
+def poly_P_xp(x, l, xp):
+    """返回与 curlfree_poly 一致的 P（n,L），支持 np/cp。"""
+    if l == 1:
+        return x  # (n,3)
+    if l == 2:
+        n = x.shape[0]
+        P = xp.zeros((n, 9), dtype=x.dtype)
+        P[:, 0:3] = x
+        P[:, 3:6] = 0.5 * x**2
+        P[:, 6] = x[:, 1] * x[:, 2]
+        P[:, 7] = x[:, 0] * x[:, 2]
+        P[:, 8] = x[:, 0] * x[:, 1]
+        return P
+    raise ValueError('Degree not implemented')
+
+
+def weight_xp(r, delta, k, xp):
+    """分区单位(PU)权重函数（np/cp 通用）。"""
+    r = r / delta
+    phi = xp.zeros_like(r)
+    if k == 0:
+        id1 = r <= (1.0 / 3.0)
+        phi[id1] = 0.75 - 2.25 * r[id1] ** 2
+        id2 = (r > 1.0 / 3.0) & (r <= 1.0)
+        phi[id2] = 1.125 * (1.0 - r[id2]) ** 2
+        return phi
+    if k == 1:
+        id1 = r <= (1.0 / 3.0)
+        phi[id1] = -4.5 / (delta ** 2)
+        id2 = (r > 1.0 / 3.0) & (r <= 1.0)
+        rr = xp.where(r[id2] == 0, xp.asarray(1.0, dtype=r.dtype), r[id2])
+        phi[id2] = (-2.25 * (1.0 - r[id2]) / (delta ** 2)) * (1.0 / rr)
+        return phi
+    raise ValueError('PU Weight function error')
+
+
+def _gpu_batch_size(n, mm):
+    """根据 n（节点数）和 mm（网格点评估数）选择较安全的 GPU batch。"""
+    target = int(os.environ.get('CFPU_GPU_TARGET_ELEMS', '1500000'))
+    min_bs = int(os.environ.get('CFPU_GPU_MIN_BATCH', '512'))
+    max_bs = int(os.environ.get('CFPU_GPU_MAX_BATCH', '262144'))
+    bs = max(1, target // max(int(n), 1))
+    bs = max(min_bs, min(bs, int(mm), max_bs))
+    return int(bs)
+
 # ===== 来自 util/gcv_cost_function.py =====
 def gcv_cost_function(lam, z, d, n):
     """广义交叉验证(GCV)成本函数"""
@@ -380,7 +427,7 @@ def load_patch_radii_txt(radii_path, *, expected_len=None):
         raise ValueError(f"radii长度({radii.shape[0]})与expected_len({int(expected_len)})不一致: {radii_path}")
     return radii
 
-def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, progress=None, progress_stage=None, patch_radii=None, patch_radii_file=None, patch_radii_in_world_units=True, patch_radii_enforce_coverage=True, feature_mask=None, feature_scale=1.0):
+def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, progress=None, progress_stage=None, patch_radii=None, patch_radii_file=None, patch_radii_in_world_units=True, patch_radii_enforce_coverage=True, feature_mask=None, feature_scale=1.0, use_gpu=False):
     if kernelinfo is None:
         kernelinfo = {
             'phi': lambda r: -r,
@@ -400,6 +447,9 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
     M = y.shape[0]
     N = x.shape[0]
     delta = 1.0
+
+    # GPU 开关：仅当用户请求且 CuPy/GPU 可用时启用
+    use_gpu = bool(use_gpu and GPU_AVAILABLE)
 
     # -------- Patch 半径/覆盖策略（支持读取 radii.txt） --------
     # 说明：cfpurecon内部会把x/y缩放到单位盒；若radii来自precompute输出（世界坐标），需要按同样scale缩放。
@@ -538,9 +588,6 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
         n = x_local.shape[0]
         CFP, P = curlfree_poly(x_local, order)
         CFPt = CFP.T
-        
-        # 使用CuPy进行GPU加速计算，添加异常处理
-        use_gpu = GPU_AVAILABLE
         
         # CPU版本计算作为默认和回退选项
         dx = xx_local.reshape(-1, 1) - xx_local.reshape(1, -1)
@@ -681,27 +728,95 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
         mm = xe_local.shape[0]
         if mm == 0:
             return (idxe_k, np.array([], dtype=int), Psi_k, np.array([], dtype=float))
-        batch_sz = int(np.ceil(100**2 / max(n, 1)))
-        temp_potential = np.zeros(mm)
-        potential_correction = np.zeros(mm)
-        for j in range(0, mm, batch_sz):
-            idb = slice(j, min(j + batch_sz, mm))
-            xe_local_batch = xe_local[idb, :]
-            dxb = xe_local_batch[:, 0].reshape(-1, 1) - xx_local.reshape(1, -1)
-            dyb = xe_local_batch[:, 1].reshape(-1, 1) - xy_local.reshape(1, -1)
-            dzb = xe_local_batch[:, 2].reshape(-1, 1) - xz_local.reshape(1, -1)
-            rb = np.sqrt(dxb**2 + dyb**2 + dzb**2)
-            _, Pb = curlfree_poly(xe_local_batch, order)
-            temp_potential[j:j+xe_local_batch.shape[0]] = np.sum(eta(rb) * (dxb * coeffsx.reshape(1, -1) + dyb * coeffsy.reshape(1, -1) + dzb * coeffsz.reshape(1, -1)), axis=1) + Pb @ coeffsp
-            if exactinterp:
-                potential_correction[j:j+xe_local_batch.shape[0]] = phi(rb) @ coeffs_correction_vec + coeffs_correction_const
-            else:
-                potential_correction[j:j+xe_local_batch.shape[0]] = Pb[:, 0:3] @ coeffs_correction_vec + coeffs_correction_const
-        potential_k = temp_potential - potential_correction
+
+        # --- 网格点评估：CPU / GPU 两条路径 ---
+        if not use_gpu:
+            batch_sz = int(np.ceil(100**2 / max(n, 1)))
+            temp_potential = np.zeros(mm)
+            potential_correction = np.zeros(mm)
+            for j in range(0, mm, batch_sz):
+                idb = slice(j, min(j + batch_sz, mm))
+                xe_local_batch = xe_local[idb, :]
+                dxb = xe_local_batch[:, 0].reshape(-1, 1) - xx_local.reshape(1, -1)
+                dyb = xe_local_batch[:, 1].reshape(-1, 1) - xy_local.reshape(1, -1)
+                dzb = xe_local_batch[:, 2].reshape(-1, 1) - xz_local.reshape(1, -1)
+                rb = np.sqrt(dxb**2 + dyb**2 + dzb**2)
+                _, Pb = curlfree_poly(xe_local_batch, order)
+                temp_potential[j:j+xe_local_batch.shape[0]] = np.sum(eta(rb) * (dxb * coeffsx.reshape(1, -1) + dyb * coeffsy.reshape(1, -1) + dzb * coeffsz.reshape(1, -1)), axis=1) + Pb @ coeffsp
+                if exactinterp:
+                    potential_correction[j:j+xe_local_batch.shape[0]] = phi(rb) @ coeffs_correction_vec + coeffs_correction_const
+                else:
+                    potential_correction[j:j+xe_local_batch.shape[0]] = Pb[:, 0:3] @ coeffs_correction_vec + coeffs_correction_const
+            potential_k = temp_potential - potential_correction
+        else:
+            # GPU 版：主要加速 (mm x n) 的距离/核函数评估与求和
+            # 为速度与显存折中，默认使用 float32；如需高精度可将环境变量 CFPU_GPU_DTYPE=float64
+            dtype_env = os.environ.get('CFPU_GPU_DTYPE', 'float32').lower()
+            g_dtype = cp.float64 if dtype_env in ('float64', 'f64', 'double') else cp.float32
+
+            xe_g = cp.asarray(xe_local, dtype=g_dtype)
+            xx_g = cp.asarray(xx_local, dtype=g_dtype)
+            xy_g = cp.asarray(xy_local, dtype=g_dtype)
+            xz_g = cp.asarray(xz_local, dtype=g_dtype)
+
+            cx = cp.asarray(coeffsx, dtype=g_dtype)
+            cy = cp.asarray(coeffsy, dtype=g_dtype)
+            cz = cp.asarray(coeffsz, dtype=g_dtype)
+            csp = cp.asarray(coeffsp, dtype=g_dtype)
+
+            cc_vec = cp.asarray(coeffs_correction_vec, dtype=g_dtype)
+            cc_cst = g_dtype(coeffs_correction_const)
+
+
+            batch_sz = _gpu_batch_size(n, mm)
+            temp_potential_g = cp.empty((mm,), dtype=g_dtype)
+            potential_corr_g = cp.empty((mm,), dtype=g_dtype)
+
+            for j in range(0, mm, batch_sz):
+                xb = xe_g[j:j+batch_sz]  # (b,3)
+
+                dxb = xb[:, 0:1] - xx_g[None, :]
+                dyb = xb[:, 1:2] - xy_g[None, :]
+                dzb = xb[:, 2:3] - xz_g[None, :]
+                rb = cp.sqrt(dxb*dxb + dyb*dyb + dzb*dzb)  # (b,n)
+
+                # 仅支持常用 order=1/2 的核；若自定义 kernelinfo，请走 CPU 路径
+                if order == 1:
+                    etab = -rb
+                    phib = -rb
+                else:
+                    etab = rb**3
+                    phib = rb**3
+
+                Pb = poly_P_xp(xb, order, cp)  # (b,L)
+
+                tmp = cp.sum(etab * (dxb*cx[None, :] + dyb*cy[None, :] + dzb*cz[None, :]), axis=1) + Pb @ csp
+                temp_potential_g[j:j+tmp.shape[0]] = tmp
+
+                if exactinterp:
+                    potential_corr_g[j:j+tmp.shape[0]] = (phib @ cc_vec) + cc_cst
+                else:
+                    potential_corr_g[j:j+tmp.shape[0]] = (Pb[:, 0:3] @ cc_vec) + cc_cst
+
+            potential_k = temp_potential_g - potential_corr_g
+
         patch_vec_k = np.full(mm, k + 1)
         return (idxe_k, patch_vec_k, Psi_k, potential_k)
+    
+    # 优化并行策略：根据任务数量动态调整并行粒度
     workers = n_jobs if (n_jobs and n_jobs > 0) else min(M, os.cpu_count() or 1)
+    
+    # 如果任务数量太少，使用单线程避免线程池开销
+    if M < workers * 2:
+        workers = 1
+    
+    # GPU 模式：避免 CPU 线程/多进程同时驱动 GPU（会导致 kernel 过碎+争用）
+    if use_gpu:
+        workers = 1
+
     mode_env = os.environ.get('CFPU_PARALLEL', 'thread')
+    if use_gpu:
+        mode_env = 'thread'
     if workers > 1 and mode_env == 'process' and SharedMemory is not None and get_context is not None:
         shm_x = SharedMemory(create=True, size=x.nbytes)
         shm_nrml = SharedMemory(create=True, size=nrml.nbytes)
@@ -727,19 +842,45 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
             shm_nrml.close()
             shm_nrml.unlink()
     elif workers > 1:
+        # 优化BLAS线程设置：根据CPU核心数动态调整
         if threadpool_limits is not None:
             blas_threads_env = os.environ.get('CFPU_BLAS_THREADS')
-            blas_threads = int(blas_threads_env) if blas_threads_env else 1
+            if blas_threads_env:
+                blas_threads = int(blas_threads_env)
+            else:
+                # 自动设置BLAS线程数为CPU核心数的一半，避免过度竞争
+                blas_threads = max(1, os.cpu_count() // 2)
+            
             with threadpool_limits(blas_threads, user_api='blas'):
+                # 使用更高效的并行策略：批量处理任务
+                batch_size = max(1, M // (workers * 4))
+                
+                def compute_batch(batch_indices):
+                    batch_results = []
+                    for k in batch_indices:
+                        batch_results.append(_compute(k))
+                    return batch_results
+                
+                # 创建批次索引
+                batches = [list(range(i, min(i + batch_size, M))) 
+                          for i in range(0, M, batch_size)]
+                
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    for k, res in enumerate(ex.map(_compute, range(M))):
-                        idxe_patch[k], patch_vec[k], Psi[k], potential_local[k] = res
-                        if progress is not None:
-                            try:
-                                progress(k + 1, M)
-                            except Exception:
-                                pass
+                    batch_results = list(ex.map(compute_batch, batches))
+                    
+                    # 展开批次结果
+                    result_idx = 0
+                    for batch in batch_results:
+                        for res in batch:
+                            idxe_patch[result_idx], patch_vec[result_idx], Psi[result_idx], potential_local[result_idx] = res
+                            if progress is not None:
+                                try:
+                                    progress(result_idx + 1, M)
+                                except Exception:
+                                    pass
+                            result_idx += 1
         else:
+            # 没有threadpool_limits时的回退策略
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 for k, res in enumerate(ex.map(_compute, range(M))):
                     idxe_patch[k], patch_vec[k], Psi[k], potential_local[k] = res
@@ -749,6 +890,7 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
                         except Exception:
                             pass
     else:
+        # 单线程执行
         for k in range(M):
             idxe_patch[k], patch_vec[k], Psi[k], potential_local[k] = _compute(k)
             if progress is not None:
@@ -761,28 +903,78 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
             progress_stage('插值-完成', None)
         except Exception:
             pass
-    patch_vec_cat = np.concatenate([pv for pv in patch_vec if pv.size > 0]) if any([pv.size > 0 for pv in patch_vec]) else np.array([], dtype=int)
-    idxe_vec_cat = np.concatenate([ie for ie in idxe_patch if ie.size > 0]) if any([ie.size > 0 for ie in idxe_patch]) else np.array([], dtype=int)
-    Psi_cat = np.concatenate([ps for ps in Psi if ps.size > 0]) if any([ps.size > 0 for ps in Psi]) else np.array([], dtype=float)
     if progress_stage is not None:
         try:
             progress_stage('加权-开始', None)
         except Exception:
             pass
-    Psi_sum = np.zeros(m)
-    if idxe_vec_cat.size > 0:
-        Psi_sum = coo_matrix((Psi_cat, (idxe_vec_cat, patch_vec_cat - 1)), shape=(m, M)).sum(axis=1).A1
+
+    # -------- 加权汇总（CPU: np.add.at；GPU: cp.add.at） --------
+    # 说明：原实现使用 coo_matrix 做 (m×M) 稀疏累加，内存和构建开销都很大；
+    # 这里改为两遍 scatter-add：先累计 Psi_sum，再累计加权后的 potential。
+    xp = cp if use_gpu else np
+    if use_gpu:
+        dtype_env = os.environ.get('CFPU_GPU_DTYPE', 'float32').lower()
+        out_dtype = cp.float64 if dtype_env in ('float64', 'f64', 'double') else cp.float32
+    else:
+        out_dtype = np.float64
+
+    Psi_sum = xp.zeros(m, dtype=out_dtype)
+
+    # 1) 累计每个网格点的权重和 Psi_sum
     for k in range(M):
-        if potential_local[k].size > 0:
-            denom = Psi_sum[idxe_patch[k]]
-            potential_local[k] = potential_local[k] * (Psi[k] / denom)
-    temp = np.zeros(m)
-    if idxe_vec_cat.size > 0:
-        temp = coo_matrix((np.concatenate([pl for pl in potential_local if pl.size > 0]), (idxe_vec_cat, patch_vec_cat - 1)), shape=(m, M)).sum(axis=1).A1
-    i_nonzero = np.where(Psi_sum > 0)[0]
-    potential = np.full(m, np.nan)
-    potential[i_nonzero] = temp[i_nonzero]
+        idxk = idxe_patch[k]
+        if idxk is None or getattr(idxk, 'size', 0) == 0:
+            continue
+        psk = Psi[k]
+        if psk is None or getattr(psk, 'size', 0) == 0:
+            continue
+
+        if use_gpu:
+            if not isinstance(idxk, cp.ndarray):
+                idxk = cp.asarray(idxk, dtype=cp.int32)
+                idxe_patch[k] = idxk
+            if not isinstance(psk, cp.ndarray):
+                psk = cp.asarray(psk, dtype=out_dtype)
+                Psi[k] = psk
+        else:
+            idxk = np.asarray(idxk, dtype=np.int64)
+            idxe_patch[k] = idxk
+            psk = np.asarray(psk, dtype=out_dtype)
+            Psi[k] = psk
+
+        xp.add.at(Psi_sum, idxk, psk)
+
+    # 2) 累计加权后的 potential
+    temp = xp.zeros(m, dtype=out_dtype)
+    eps = out_dtype(1e-30)
+
+    for k in range(M):
+        idxk = idxe_patch[k]
+        if idxk is None or getattr(idxk, 'size', 0) == 0:
+            continue
+        psk = Psi[k]
+        if psk is None or getattr(psk, 'size', 0) == 0:
+            continue
+        potk = potential_local[k]
+        if potk is None or getattr(potk, 'size', 0) == 0:
+            continue
+
+        if use_gpu and not isinstance(potk, cp.ndarray):
+            potk = cp.asarray(potk, dtype=out_dtype)
+            potential_local[k] = potk
+
+        denom = xp.maximum(Psi_sum[idxk], eps)
+        w = psk / denom
+        xp.add.at(temp, idxk, potk * w)
+
+    potential = xp.full(m, xp.nan, dtype=out_dtype)
+    mask = Psi_sum > 0
+    potential[mask] = temp[mask]
     potential = potential.reshape((mmy, mmx, mmz), order='F')
+    if use_gpu:
+        potential = cp.asnumpy(potential)
+
     X = X * scale + minxx[0]
     Y = Y * scale + minxx[1]
     Z = Z * scale + minxx[2]
@@ -798,6 +990,9 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
 __all__ = [
     'GPU_AVAILABLE',
     'curlfree_poly',
+    'poly_P_xp',
+    'weight_xp',
+    '_gpu_batch_size',
     'gcv_cost_function',
     'weight',
     'configure_patch_radii',

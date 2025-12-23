@@ -19,7 +19,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--inputs', nargs='+')
     ap.add_argument('--out_root', default=os.path.join('output', 'cfpu_input'))
-    ap.add_argument('--angle_threshold', type=float, default=30.0)
+    ap.add_argument('--angle_threshold', type=float, default=50.0)
     ap.add_argument('--r_small_factor', type=float, default=0.5)
     ap.add_argument('--r_large_factor', type=float, default=3.0)
     ap.add_argument('--edge_split_threshold', type=float, default=None)
@@ -38,7 +38,12 @@ def main():
             os.path.join('input', 'nonsmooth_geometry', 'Prism_surface_cellnormals.vtp'),
             os.path.join('input', 'nonsmooth_geometry', 'TruncatedRing_surface_cellnormals.vtp'),
             os.path.join('input', 'combinatorial_geometry', 'CompositeBody1_surface_cellnormals.vtp'),
-            os.path.join('input', 'combinatorial_geometry', 'CompositeBody2_surface_cellnormals.vtp')
+            os.path.join('input', 'combinatorial_geometry', 'CompositeBody2_surface_cellnormals.vtp'),
+            os.path.join('input', 'complex_geometry', 'Gear_surface_cellnormals.vtp'),
+            os.path.join('input', 'complex_geometry', 'LinkedGear_surface_cellnormals.vtp'),
+            os.path.join('input', 'complex_geometry', 'Nail_surface_cellnormals.vtp'),
+            os.path.join('input', 'complex_geometry', 'PressureLubricatedCam_surface_cellnormals.vtp'),
+            os.path.join('input', 'complex_geometry', 'SlidewayRotatingModel_surface_cellnormals.vtp'),
         ]
     build_cfpu_input = _get_builder()
     for inp in inputs:
