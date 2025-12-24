@@ -1836,36 +1836,8 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
     np.savetxt(os.path.join(output_dir, 'patches.txt'), patches)
     np.savetxt(os.path.join(output_dir, 'radii.txt'), radii)
     try:
-        with open(os.path.join(output_dir, 'sharp_segments_debug.json'), 'w') as f:
-            json.dump({'segments': debug_segments}, f)
-    except Exception:
-        pass
-    try:
         with open(os.path.join(output_dir, 'feature_count.txt'), 'w') as f:
             f.write(str(feature_count))
-    except Exception:
-        pass
-    try:
-        base_offset = base_pts.shape[0]
-        vid_to_index = {v: i for i, v in enumerate(sorted(list(sharp_vertex_ids)))}
-        sharp_patch_samples = {}
-        for i, v in enumerate(feat_assign_vertex):
-            if v in vid_to_index:
-                pi = vid_to_index[v]
-                sharp_patch_samples.setdefault(int(pi), []).append(int(base_offset + i))
-        with open(os.path.join(output_dir, 'sharp_patch_samples.json'), 'w') as f:
-            json.dump(sharp_patch_samples, f)
-        sharp_group_samples = {}
-        seg_vertex_sets = {gid: set(map(int, seg['vertices'])) for gid, seg in enumerate(segments)}
-        for i, v in enumerate(feat_assign_vertex):
-            for gid, vset in seg_vertex_sets.items():
-                if v in vset:
-                    sharp_group_samples.setdefault(gid, []).append(int(base_offset + i))
-                    break
-        with open(os.path.join(output_dir, 'sharp_group_samples.json'), 'w') as f:
-            json.dump(sharp_group_samples, f)
-        with open(os.path.join(output_dir, 'sharp_group_fit_report.json'), 'w') as f:
-            json.dump(fit_reports, f)
     except Exception:
         pass
     return nodes, normals, patches
