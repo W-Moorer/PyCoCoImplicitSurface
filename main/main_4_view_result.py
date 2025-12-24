@@ -18,7 +18,7 @@ def main():
     """
     ap = argparse.ArgumentParser()
     ap.add_argument('--recon_dir', type=str, 
-                   default='output/PressureLubricatedCam_recon_GPU',
+                   default='output/LinkedGear_recon_GPU',
                    help='CFPU重建结果输出目录')
     ap.add_argument('--window_size', type=int, nargs=2, default=[1600, 1200],
                    help='可视化窗口大小 (width height)')

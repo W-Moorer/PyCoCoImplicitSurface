@@ -150,55 +150,83 @@ def weight(r, delta, k):
 
 _GLOBAL_X = None
 _GLOBAL_NRML = None
-def _init_proc(shm_name_x, shape_x, dtype_x, shm_name_nrml, shape_nrml, dtype_nrml):
+_GLOBAL_CURVE = None
+
+def _init_proc(shm_name_x, shape_x, dtype_x,
+               shm_name_nrml, shape_nrml, dtype_nrml,
+               shm_name_curve=None, shape_curve=None, dtype_curve=None):
     if SharedMemory is None:
         return
     shm_x = SharedMemory(name=shm_name_x)
     shm_nrml = SharedMemory(name=shm_name_nrml)
     import numpy as _np
-    global _GLOBAL_X, _GLOBAL_NRML, _SHM_X, _SHM_NRML
+    global _GLOBAL_X, _GLOBAL_NRML, _GLOBAL_CURVE, _SHM_X, _SHM_NRML, _SHM_CURVE
     _GLOBAL_X = _np.ndarray(shape_x, dtype=_np.dtype(dtype_x), buffer=shm_x.buf)
     _GLOBAL_NRML = _np.ndarray(shape_nrml, dtype=_np.dtype(dtype_nrml), buffer=shm_nrml.buf)
     _SHM_X = shm_x
     _SHM_NRML = shm_nrml
 
+    if shm_name_curve is not None:
+        shm_curve = SharedMemory(name=shm_name_curve)
+        _GLOBAL_CURVE = _np.ndarray(shape_curve, dtype=_np.dtype(dtype_curve), buffer=shm_curve.buf)
+        _SHM_CURVE = shm_curve
+    else:
+        _GLOBAL_CURVE = None
+        _SHM_CURVE = None
+
 def _compute_proc(args):
-    k, idk, nn_dist_k, y0, y1, y2, patchRad_k, order_k, exactinterp_k, nrmlreg_k, nrmllambda_k, nrmlschur_k, trbl_local, potreg_k, potlambda_k, startx_k, starty_k, startz_k, griddx_k, mmx_k, mmy_k, mmz_k = args
+    # 新增 curve_idx_k：该 patch 对应的曲线点索引（在 _GLOBAL_CURVE 中）
+    (k, idk, curve_idx_k, nn_dist_k,
+     y0, y1, y2, patchRad_k, order_k,
+     exactinterp_k, nrmlreg_k, nrmllambda_k, nrmlschur_k,
+     trbl_local, potreg_k, potlambda_k,
+     startx_k, starty_k, startz_k, griddx_k, mmx_k, mmy_k, mmz_k) = args
+
     if idk.size == 0:
         return (np.array([], dtype=int), np.array([], dtype=int), np.array([], dtype=float), np.array([], dtype=float))
+
     h2 = np.max(nn_dist_k)**2 if nn_dist_k.size else 1.0
     x_local = _GLOBAL_X[idk, :]
     xx_local = x_local[:, 0]
     xy_local = x_local[:, 1]
     xz_local = x_local[:, 2]
     n = x_local.shape[0]
+
     CFP, P = curlfree_poly(x_local, order_k)
     CFPt = CFP.T
+
     dx = xx_local.reshape(-1, 1) - xx_local.reshape(1, -1)
     dy = xy_local.reshape(-1, 1) - xy_local.reshape(1, -1)
     dz = xz_local.reshape(-1, 1) - xz_local.reshape(1, -1)
     r = np.sqrt(dx**2 + dy**2 + dz**2)
+
     ui = _GLOBAL_NRML[idk, :]
     l_local = 3 if order_k == 1 else 9
     b = np.zeros(3*n + l_local)
     b[0:3*n:3] = ui[:, 0]
     b[1:3*n:3] = ui[:, 1]
     b[2:3*n:3] = ui[:, 2]
+
     A = np.zeros((3*n + l_local, 3*n + l_local))
+
     if order_k == 1:
         eta_temp = -r
-        zeta_temp = -np.divide(1.0, r, where=(r!=0))
+        zeta_temp = -np.divide(1.0, r, where=(r != 0))
     elif order_k == 2:
         eta_temp = r**3
-        zeta_temp = 3.0*r
+        zeta_temp = 3.0 * r
     else:
         raise ValueError('Curl-free polynomial degree not supported')
+
+    np.fill_diagonal(zeta_temp, 0.0)
+
     dphi_xx = zeta_temp * dx**2 + eta_temp
     dphi_yy = zeta_temp * dy**2 + eta_temp
     dphi_zz = zeta_temp * dz**2 + eta_temp
     dphi_xy = zeta_temp * dx * dy
     dphi_xz = zeta_temp * dx * dz
     dphi_yz = zeta_temp * dy * dz
+
     A[0:3*n:3, 0:3*n:3] = dphi_xx
     A[0:3*n:3, 1:3*n:3] = dphi_xy
     A[0:3*n:3, 2:3*n:3] = dphi_xz
@@ -210,12 +238,15 @@ def _compute_proc(args):
     A[2:3*n:3, 2:3*n:3] = dphi_zz
     A[0:3*n, 3*n:] = CFP
     A[3*n:, 0:3*n] = CFPt
+
+    # 求解 curl-free 系数（保持你原逻辑）
     if nrmlreg_k != 2:
         if nrmlreg_k == 1:
             A[0:3*n, 0:3*n] = A[0:3*n, 0:3*n] + 3*n*nrmllambda_k*np.eye(3*n)
         elif nrmlreg_k == 3:
             if np.any(trbl_local):
                 A[0:3*n, 0:3*n] = A[0:3*n, 0:3*n] + 3*n*nrmllambda_k*np.eye(3*n)
+
         if nrmlschur_k == 0:
             try:
                 coeffs = solve(A, b, assume_a='sym', check_finite=False)
@@ -256,47 +287,149 @@ def _compute_proc(args):
         A0 = A0 + lam*np.eye(3*n)
         coeffs = F2 @ (U @ (z / (D**2 + lam)))
         coeffsp = solve(G1, w1 - F1.T @ (A0 @ coeffs), check_finite=False)
+
     coeffsx = coeffs[0:3*n:3]
     coeffsy = coeffs[1:3*n:3]
     coeffsz = coeffs[2:3*n:3]
-    temp_potential_nodes = np.sum(eta_temp * (dx * coeffsx.reshape(1, -1) + dy * coeffsy.reshape(1, -1) + dz * coeffsz.reshape(1, -1)), axis=1) + P @ coeffsp
+
+    # 节点处势能
+    temp_potential_nodes = np.sum(
+        eta_temp * (dx * coeffsx.reshape(1, -1) + dy * coeffsy.reshape(1, -1) + dz * coeffsz.reshape(1, -1)),
+        axis=1
+    ) + P @ coeffsp
+
+    # ===== residual correction：exact interpolation（做法A：节点 + 曲线点）=====
+    use_extended_centers = False
+    xx_corr = xx_local
+    xy_corr = xy_local
+    xz_corr = xz_local
+    corr_size = n
+    coeffs_correction = None
+
     if exactinterp_k:
-        P0 = np.ones((n, 1))
-        A1 = np.ones((n+1, n+1))
-        A1[0:n, 0:n] = (-r if order_k == 1 else r**3)
-        A1[-1, -1] = 0.0
-        b1 = np.concatenate([temp_potential_nodes, np.array([0.0])])
-        if potreg_k != 2:
-            if potreg_k == 1:
-                A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
-            elif potreg_k == 3:
-                if np.any(trbl_local):
-                    A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
-            coeffs_correction = solve(A1, b1, assume_a='sym', check_finite=False)
+        curve_local = np.empty((0, 3), dtype=float)
+        if (_GLOBAL_CURVE is not None) and (curve_idx_k is not None) and (getattr(curve_idx_k, "size", 0) > 0):
+            curve_local = _GLOBAL_CURVE[np.asarray(curve_idx_k, dtype=int), :]
+
+            # 去掉与节点重合的曲线点，避免重复中心导致奇异
+            if curve_local.shape[0] > 0:
+                dmin = cKDTree(x_local).query(curve_local, k=1)[0]
+                curve_local = curve_local[dmin > 1e-10]
+
+            # 去重
+            if curve_local.shape[0] > 1:
+                key = np.round(curve_local, decimals=10)
+                _, ui = np.unique(key, axis=0, return_index=True)
+                curve_local = curve_local[np.sort(ui)]
+
+        if curve_local.shape[0] > 0:
+            use_extended_centers = True
+            x_corr = np.vstack([x_local, curve_local])
+            xx_corr = x_corr[:, 0]
+            xy_corr = x_corr[:, 1]
+            xz_corr = x_corr[:, 2]
+            corr_size = x_corr.shape[0]
+
+            # 计算 s_m 在 x_corr 上的值（中心仍为 x_local）
+            dxc = x_corr[:, 0:1] - xx_local.reshape(1, -1)
+            dyc = x_corr[:, 1:2] - xy_local.reshape(1, -1)
+            dzc = x_corr[:, 2:3] - xz_local.reshape(1, -1)
+            rc = np.sqrt(dxc**2 + dyc**2 + dzc**2)
+            etac = (-rc if order_k == 1 else rc**3)
+            Pc = poly_P_xp(x_corr, order_k, np)
+            temp_potential_corr = np.sum(
+                etac * (dxc * coeffsx.reshape(1, -1) + dyc * coeffsy.reshape(1, -1) + dzc * coeffsz.reshape(1, -1)),
+                axis=1
+            ) + Pc @ coeffsp
+
+            # A1 用 x_corr 两两距离
+            dx2 = x_corr[:, 0:1] - x_corr[None, :, 0]
+            dy2 = x_corr[:, 1:2] - x_corr[None, :, 1]
+            dz2 = x_corr[:, 2:3] - x_corr[None, :, 2]
+            r2 = np.sqrt(dx2**2 + dy2**2 + dz2**2)
+            phi2 = (-r2 if order_k == 1 else r2**3)
+
+            A1 = np.ones((corr_size + 1, corr_size + 1))
+            A1[0:corr_size, 0:corr_size] = phi2
+            A1[-1, -1] = 0.0
+            b1 = np.concatenate([temp_potential_corr, np.array([0.0])])
+
+            if potreg_k != 2:
+                if potreg_k == 1:
+                    A1[0:corr_size, 0:corr_size] = A1[0:corr_size, 0:corr_size] + corr_size*potlambda_k*np.eye(corr_size)
+                elif potreg_k == 3:
+                    if np.any(trbl_local):
+                        A1[0:corr_size, 0:corr_size] = A1[0:corr_size, 0:corr_size] + corr_size*potlambda_k*np.eye(corr_size)
+
+                # 求解（增加容错，不改变正常情况）
+                try:
+                    coeffs_correction = solve(A1, b1, assume_a='sym', check_finite=False)
+                except Exception:
+                    A1[0:corr_size, 0:corr_size] = A1[0:corr_size, 0:corr_size] + corr_size*1e-10*np.eye(corr_size)
+                    coeffs_correction = np.linalg.lstsq(A1, b1, rcond=None)[0]
+            else:
+                # GCV 分支（用 corr_size）
+                P0 = np.ones((corr_size, 1))
+                Lc = P0.shape[1]
+                b2 = b1[0:corr_size]
+                A2 = A1[0:corr_size, 0:corr_size]
+                F1, G = qr(P0, mode='economic')
+                F2 = F1[:, Lc:]
+                F1 = F1[:, :Lc]
+                G1 = G[:Lc, :Lc]
+                w1 = F1.T @ b2
+                w2 = F2.T @ b2
+                L = cholesky(F2.T @ A2 @ F2)
+                U, D, _ = svd(L.T)
+                D = np.diag(D)
+                z2 = U.T @ w2
+                lam = fminbound(lambda t: gcv_cost_function(t, z2, D, 1.0/h2), -10, 35)
+                lam = (1.0/h2) * np.exp(-lam)
+                A2 = A2 + lam*np.eye(corr_size)
+                temp = F2 @ (U @ (z2 / (D**2 + lam)))
+                coeffs_correction = np.concatenate([temp, solve(G1, w1 - F1.T @ (A2 @ temp), check_finite=False)])
         else:
-            Lc = P0.shape[1]
-            b2 = b1[0:n]
-            A2 = A1[0:n, 0:n]
-            F1, G = qr(P0, mode='economic')
-            F2 = F1[:, Lc:]
-            F1 = F1[:, :Lc]
-            G1 = G[:Lc, :Lc]
-            w1 = F1.T @ b2
-            w2 = F2.T @ b2
-            L = cholesky(F2.T @ A2 @ F2)
-            U, D, _ = svd(L.T)
-            D = np.diag(D)
-            z2 = U.T @ w2
-            lam = fminbound(lambda t: gcv_cost_function(t, z2, D, 1.0/h2), -10, 35)
-            lam = (1.0/h2) * np.exp(-lam)
-            A2 = A2 + lam*np.eye(n)
-            temp = F2 @ (U @ (z2 / (D**2 + lam)))
-            coeffs_correction = np.concatenate([temp, solve(G1, w1 - F1.T @ (A2 @ temp), check_finite=False)])
+            # 无曲线点：完全走你原来的 nodes-only exact interpolation
+            P0 = np.ones((n, 1))
+            A1 = np.ones((n+1, n+1))
+            A1[0:n, 0:n] = (-r if order_k == 1 else r**3)
+            A1[-1, -1] = 0.0
+            b1 = np.concatenate([temp_potential_nodes, np.array([0.0])])
+            if potreg_k != 2:
+                if potreg_k == 1:
+                    A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
+                elif potreg_k == 3:
+                    if np.any(trbl_local):
+                        A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
+                coeffs_correction = solve(A1, b1, assume_a='sym', check_finite=False)
+            else:
+                Lc = P0.shape[1]
+                b2 = b1[0:n]
+                A2 = A1[0:n, 0:n]
+                F1, G = qr(P0, mode='economic')
+                F2 = F1[:, Lc:]
+                F1 = F1[:, :Lc]
+                G1 = G[:Lc, :Lc]
+                w1 = F1.T @ b2
+                w2 = F2.T @ b2
+                L = cholesky(F2.T @ A2 @ F2)
+                U, D, _ = svd(L.T)
+                D = np.diag(D)
+                z2 = U.T @ w2
+                lam = fminbound(lambda t: gcv_cost_function(t, z2, D, 1.0/h2), -10, 35)
+                lam = (1.0/h2) * np.exp(-lam)
+                A2 = A2 + lam*np.eye(n)
+                temp = F2 @ (U @ (z2 / (D**2 + lam)))
+                coeffs_correction = np.concatenate([temp, solve(G1, w1 - F1.T @ (A2 @ temp), check_finite=False)])
     else:
+        # 线性修正（不变）
         P1 = np.hstack([P[:, 0:3], np.ones((n, 1))])
         coeffs_correction = np.linalg.lstsq(P1, temp_potential_nodes, rcond=None)[0]
+
     coeffs_correction_const = coeffs_correction[-1]
     coeffs_correction_vec = coeffs_correction[:-1]
+
+    # ===== patch 内网格点构建（不变）=====
     ix = int(np.round((y0 - startx_k) / griddx_k)) + 1
     iy = int(np.round((y1 - starty_k) / griddx_k)) + 1
     iz = int(np.round((y2 - startz_k) / griddx_k)) + 1
@@ -310,45 +443,68 @@ def _compute_proc(args):
     XX3, YY3, ZZ3 = np.meshgrid(xxg, yyg, zzg, indexing='xy')
     De = (y0 - XX3)**2 + (y1 - YY3)**2 + (y2 - ZZ3)**2
     idmask = De.reshape(-1) < patchRad_k**2
+
     ixs2 = np.repeat(ixs.reshape(1, -1), len(yyg), axis=0)
     ixs2 = np.repeat(ixs2[:, :, np.newaxis], len(zzg), axis=2)
     iys2 = np.repeat(iys.reshape(-1, 1), len(xxg), axis=1)
     iys2 = np.repeat(iys2[:, :, np.newaxis], len(zzg), axis=2)
     izs2 = np.repeat(izs.reshape(1, 1, -1), len(yyg), axis=0)
     izs2 = np.repeat(izs2, len(xxg), axis=1)
+
     temp_idg = (iys2 + (ixs2 - 1) * mmy_k) + (izs2 - 1) * (mmx_k * mmy_k)
     temp_idg = temp_idg.reshape(-1)
     temp_idg = temp_idg[idmask] - 1
     De = np.sqrt(De.reshape(-1)[idmask])
+
     idxe_k = temp_idg.astype(int)
     Psi_k = weight(De, patchRad_k, 0)
+
     xe_local = np.vstack([XX3.reshape(-1), YY3.reshape(-1), ZZ3.reshape(-1)]).T
     xe_local = xe_local[idmask, :]
     mm = xe_local.shape[0]
     if mm == 0:
         return (idxe_k, np.array([], dtype=int), Psi_k, np.array([], dtype=float))
+
     batch_sz = int(np.ceil(100**2 / max(n, 1)))
     temp_potential = np.zeros(mm)
     potential_correction = np.zeros(mm)
+
     for j in range(0, mm, batch_sz):
         idb = slice(j, min(j + batch_sz, mm))
         xe_local_batch = xe_local[idb, :]
+
+        # s_m 仍然相对 x_local（n）
         dxb = xe_local_batch[:, 0].reshape(-1, 1) - xx_local.reshape(1, -1)
         dyb = xe_local_batch[:, 1].reshape(-1, 1) - xy_local.reshape(1, -1)
         dzb = xe_local_batch[:, 2].reshape(-1, 1) - xz_local.reshape(1, -1)
         rb = np.sqrt(dxb**2 + dyb**2 + dzb**2)
         _, Pb = curlfree_poly(xe_local_batch, order_k)
+
         if order_k == 1:
             etab = -rb
-            phib = -rb
         else:
             etab = rb**3
-            phib = rb**3
-        temp_potential[j:j+xe_local_batch.shape[0]] = np.sum(etab * (dxb * coeffsx.reshape(1, -1) + dyb * coeffsy.reshape(1, -1) + dzb * coeffsz.reshape(1, -1)), axis=1) + Pb @ coeffsp
+
+        temp_potential[j:j+xe_local_batch.shape[0]] = np.sum(
+            etab * (dxb * coeffsx.reshape(1, -1) + dyb * coeffsy.reshape(1, -1) + dzb * coeffsz.reshape(1, -1)),
+            axis=1
+        ) + Pb @ coeffsp
+
         if exactinterp_k:
-            potential_correction[j:j+xe_local_batch.shape[0]] = phib @ coeffs_correction_vec + coeffs_correction_const
+            if use_extended_centers:
+                # correction 相对 x_corr（corr_size）
+                dxcg = xe_local_batch[:, 0].reshape(-1, 1) - xx_corr.reshape(1, -1)
+                dycg = xe_local_batch[:, 1].reshape(-1, 1) - xy_corr.reshape(1, -1)
+                dzcg = xe_local_batch[:, 2].reshape(-1, 1) - xz_corr.reshape(1, -1)
+                rcg = np.sqrt(dxcg**2 + dycg**2 + dzcg**2)
+                phicg = (-rcg if order_k == 1 else rcg**3)
+                potential_correction[j:j+xe_local_batch.shape[0]] = phicg @ coeffs_correction_vec + coeffs_correction_const
+            else:
+                phib = (-rb if order_k == 1 else rb**3)
+                potential_correction[j:j+xe_local_batch.shape[0]] = phib @ coeffs_correction_vec + coeffs_correction_const
         else:
             potential_correction[j:j+xe_local_batch.shape[0]] = Pb[:, 0:3] @ coeffs_correction_vec + coeffs_correction_const
+
     potential_k = temp_potential - potential_correction
     patch_vec_k = np.full(mm, k + 1)
     return (idxe_k, patch_vec_k, Psi_k, potential_k)
@@ -427,7 +583,14 @@ def load_patch_radii_txt(radii_path, *, expected_len=None):
         raise ValueError(f"radii长度({radii.shape[0]})与expected_len({int(expected_len)})不一致: {radii_path}")
     return radii
 
-def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, progress=None, progress_stage=None, patch_radii=None, patch_radii_file=None, patch_radii_in_world_units=True, patch_radii_enforce_coverage=True, feature_mask=None, feature_scale=1.0, use_gpu=False):
+def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
+              progress=None, progress_stage=None,
+              patch_radii=None, patch_radii_file=None,
+              patch_radii_in_world_units=True, patch_radii_enforce_coverage=True,
+              feature_mask=None, feature_scale=1.0, use_gpu=False,
+              curve_points=None, curve_points_in_unit=False,
+              curve_patch_map=None, curve_max_points_per_patch=200,
+              curve_only_feature_patches=True):
     if kernelinfo is None:
         kernelinfo = {
             'phi': lambda r: -r,
@@ -525,6 +688,46 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
                     dists = np.linalg.norm(x[id_list, :] - y[k, :], axis=1)
                     nn_dist_list.append(dists)
             patchRad = patch_radii_arr
+            
+    # ===== 做法A：曲线约束（可选）=====
+    # curve_points: world坐标(默认) 或 unit box(若 curve_points_in_unit=True)
+    # curve_patch_map: dict，可直接用 main_1 输出的 sharp_curve_feature_patch_map.json
+    curve_scaled = None
+    curve_idx_list = None
+
+    if curve_points is not None:
+        curve_points = np.asarray(curve_points, dtype=float)
+        if curve_points.ndim == 2 and curve_points.shape[1] == 3 and curve_points.shape[0] > 0:
+            if curve_points_in_unit:
+                curve_scaled = curve_points
+            else:
+                curve_scaled = (curve_points - minxx) / scale
+
+            curve_idx_list = [np.empty((0,), dtype=int) for _ in range(M)]
+
+            if isinstance(curve_patch_map, dict) and len(curve_patch_map) > 0:
+                # 优先使用预计算映射（更快）
+                for kk in range(M):
+                    lst = curve_patch_map.get(str(kk), curve_patch_map.get(kk, []))
+                    curve_idx_list[kk] = np.asarray(lst, dtype=int)
+            else:
+                # 无映射时：按 patch 球域分配（默认只对 feature patch 生效）
+                tree_curve = cKDTree(curve_scaled)
+                fm = np.asarray(feature_mask, dtype=bool)[:M] if feature_mask is not None else None
+                cap = int(curve_max_points_per_patch) if (curve_max_points_per_patch is not None) else 0
+
+                for kk in range(M):
+                    if curve_only_feature_patches and (fm is not None) and (not fm[kk]):
+                        continue
+                    ids = tree_curve.query_ball_point(y[kk, :], float(patchRad[kk]))
+                    if cap > 0 and len(ids) > cap:
+                        ids = np.asarray(ids, dtype=int)
+                        d = np.linalg.norm(curve_scaled[ids, :] - y[kk, :], axis=1)
+                        ids = ids[np.argsort(d)[:cap]]
+                    curve_idx_list[kk] = np.asarray(ids, dtype=int)
+
+
+    # -------- 生成网格/插值 --------
     exactinterp = reginfo.get('exactinterp', 1)
     nrmlreg = reginfo.get('nrmlreg', 0)
     nrmllambda = reginfo.get('nrmllambda', 0)
@@ -824,18 +1027,52 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None, 
         np.ndarray(nrml.shape, dtype=nrml.dtype, buffer=shm_nrml.buf)[:] = nrml
         try:
             ctx = get_context('spawn')
-            global _GLOBAL_X, _GLOBAL_NRML
-            _GLOBAL_X = None
-            _GLOBAL_NRML = None
-            with ctx.Pool(processes=workers, initializer=_init_proc, initargs=(shm_x.name, x.shape, x.dtype.str, shm_nrml.name, nrml.shape, nrml.dtype.str)) as pool:
-                arg_iter = ((k, idx[k], nn_dist_list[k], y[k, 0], y[k, 1], y[k, 2], patchRad[k], order, exactinterp, nrmlreg, nrmllambda, nrmlschur, trbl_id[idx[k]], potreg, potlambda, startx, starty, startz, griddx, mmx, mmy, mmz) for k in range(M))
-                for k, res in enumerate(pool.imap(_compute_proc, arg_iter)):
-                    idxe_patch[k], patch_vec[k], Psi[k], potential_local[k] = res
-                    if progress is not None:
-                        try:
-                            progress(k + 1, M)
-                        except Exception:
-                            pass
+
+            if curve_scaled is not None and getattr(curve_scaled, "size", 0) > 0:
+                shm_curve = SharedMemory(create=True, size=curve_scaled.nbytes)
+                np.ndarray(curve_scaled.shape, dtype=curve_scaled.dtype, buffer=shm_curve.buf)[:] = curve_scaled
+
+            try:
+                ctx = get_context('spawn')
+                global _GLOBAL_X, _GLOBAL_NRML, _GLOBAL_CURVE
+                _GLOBAL_X = None
+                _GLOBAL_NRML = None
+                _GLOBAL_CURVE = None
+
+                with ctx.Pool(
+                    processes=workers,
+                    initializer=_init_proc,
+                    initargs=(
+                        shm_x.name, x.shape, x.dtype.str,
+                        shm_nrml.name, nrml.shape, nrml.dtype.str,
+                        (shm_curve.name if shm_curve is not None else None),
+                        (curve_scaled.shape if shm_curve is not None else None),
+                        (curve_scaled.dtype.str if shm_curve is not None else None),
+                    )
+                ) as pool:
+                    arg_iter = (
+                        (k, idx[k],
+                        (curve_idx_list[k] if curve_idx_list is not None else np.empty((0,), dtype=int)),
+                        nn_dist_list[k],
+                        y[k, 0], y[k, 1], y[k, 2],
+                        patchRad[k], order, exactinterp, nrmlreg, nrmllambda, nrmlschur,
+                        trbl_id[idx[k]], potreg, potlambda,
+                        startx, starty, startz, griddx, mmx, mmy, mmz)
+                        for k in range(M)
+                    )
+
+                    for k, res in enumerate(pool.imap(_compute_proc, arg_iter)):
+                        idxe_patch[k], patch_vec[k], Psi[k], potential_local[k] = res
+                        if progress is not None:
+                            try:
+                                progress(k + 1, M)
+                            except Exception:
+                                pass
+            finally:
+                if shm_curve is not None:
+                    shm_curve.close()
+                    shm_curve.unlink()
+
         finally:
             shm_x.close()
             shm_x.unlink()
