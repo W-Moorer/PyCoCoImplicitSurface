@@ -1124,6 +1124,14 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
         sharp_vertex_ids.add(int(e['point2_idx']))
     sharp_vertex_ids = sorted(list(sharp_vertex_ids))
     
+    # 顶点 -> incident sharp edge records（用于凸/凹判断投票）
+    pid_to_incident_edges = collections.defaultdict(list)
+    for e in sharp_edges:
+        a = int(e['point1_idx'])
+        b = int(e['point2_idx'])
+        pid_to_incident_edges[a].append(e)
+        pid_to_incident_edges[b].append(e)
+
     # 2. 构建尖锐边的法向量分离（使用1e-5微小距离偏移）
     edge_info = {}
     for e in sharp_edges:
@@ -1237,9 +1245,230 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
     # new_normals = np.array(new_normals)
 
     
+#     # 5. 尖锐边法向量分离（方案1）：只在尖锐边点上拆分，且按“尖锐边切断的一环面连通分量(面簇)”拆分
+#     #    —— 每个面簇生成 1 个节点 + 1 个法向（不再按每个面生成节点）
+
+#     # 5.0 准备：尖锐边集合（用几何点id构成key，避免 split 后点id不一致）
+#     sharp_geo_edges = set()
+#     for e in sharp_edges:
+#         gA = int(e.get('geo_point1_idx', inv[int(e['point1_idx'])]))
+#         gB = int(e.get('geo_point2_idx', inv[int(e['point2_idx'])]))
+#         if gA == gB:
+#             continue
+#         sharp_geo_edges.add((gA, gB) if gA < gB else (gB, gA))
+
+#     # 5.0.1 工具函数
+#     def _normalize(v):
+#         n = float(np.linalg.norm(v))
+#         return v / max(n, 1e-12)
+
+#     def _tri_area(fid):
+#         a, b, c = faces[int(fid)]
+#         v0, v1, v2 = points[int(a)], points[int(b)], points[int(c)]
+#         return 0.5 * float(np.linalg.norm(np.cross(v1 - v0, v2 - v0)))
+
+#     # 参考你给的 test_separate.py：将“其他法向合力”投影到当前法向切平面，取反方向作为分离方向
+#     # （只用于决定偏移方向，不用于分组）
+#     def _separate_dir_from_normals(n_target, n_others):
+#         n1 = _normalize(n_target)
+#         if not n_others:
+#             return np.zeros(3, dtype=float)
+#         n_sum = np.sum(np.asarray(n_others, dtype=float), axis=0)
+#         v_proj = n_sum - float(np.dot(n_sum, n1)) * n1
+#         if float(np.linalg.norm(v_proj)) < 1e-12:
+#             return np.zeros(3, dtype=float)
+#         return _normalize(-v_proj)
+
+# # 如果你发现整体凸凹反了，把这个改成 -1 即可（无需改其它逻辑）
+#     CONVEX_SIGN = -1
+
+#     def _edge_is_convex_signed(e):
+#         """
+#         用有符号二面角的符号判断凸/凹（需要 mesh 的法向大体一致朝外）
+#         返回 True=凸, False=凹
+#         """
+#         # 注意：detect_sharp_edges 里 edge key 来自 sorted(geo ids)，所以 point1_idx/point2_idx 的方向是稳定的
+#         p1 = int(e['point1_idx'])
+#         p2 = int(e['point2_idx'])
+
+#         n1 = _normalize(cell_normals[int(e['face1'])])
+#         n2 = _normalize(cell_normals[int(e['face2'])])
+
+#         edge_dir = _normalize(points[p2] - points[p1])  # 稳定方向
+#         s = float(np.dot(edge_dir, np.cross(n1, n2))) * CONVEX_SIGN
+
+#         # s 的符号区分凸/凹（若反了就把 CONVEX_SIGN 取 -1）
+#         return s > 0.0
+
+#     # 5.1 计算偏移距离（你现在的“固定优先，小模型比例”的规则保留）
+#     bbox_diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
+#     abs_inset = 1e-4
+#     rel_inset = 1e-4
+#     inset_dist = min(abs_inset, rel_inset * bbox_diag)
+#     print(f"偏移距离: {inset_dist}")
+
+#     # 5.2 预计算面片质心（用于兜底方向/轻微向内移动）
+#     face_centroids = np.mean(points[faces], axis=1)  # (n_faces, 3)
+
+#     # 5.3 对每个“尖锐边上的点 pid”，用尖锐边切断一环面，得到面簇（连通分量）
+#     #     两个面在 pid 处可连通 <=> 它们共享的边 (pid, q) 不是尖锐边
+#     from collections import defaultdict
+
+#     pid_to_face_groups = {}     # pid -> [ [fid...], [fid...], ... ]
+#     pid_to_group_normals = {}   # pid -> [n0, n1, ...]
+#     split_pids = set()
+
+#     for pid in sharp_vertex_ids:
+#         fl = p2f.get(pid, [])
+#         if len(fl) <= 1:
+#             continue
+
+#         gpid = int(inv[int(pid)])
+
+#         # 建 edge -> faces 映射（只看经过 pid 的两条边）
+#         edge2faces = defaultdict(list)
+#         for fid in fl:
+#             tri = faces[int(fid)]
+#             # tri 中除 pid 外的两个点
+#             for q in tri:
+#                 q = int(q)
+#                 if q == int(pid):
+#                     continue
+#                 gq = int(inv[q])
+#                 key = (gpid, gq) if gpid < gq else (gq, gpid)
+#                 edge2faces[key].append(int(fid))
+
+#         # union-find 在 fl 上做连通分量
+#         parent = {int(fid): int(fid) for fid in fl}
+
+#         def find(x):
+#             while parent[x] != x:
+#                 parent[x] = parent[parent[x]]
+#                 x = parent[x]
+#             return x
+
+#         def union(a, b):
+#             ra, rb = find(a), find(b)
+#             if ra != rb:
+#                 parent[ra] = rb
+
+#         # 共享同一条“非尖锐边”的 face union 在一起
+#         for edge_key, fids in edge2faces.items():
+#             if edge_key in sharp_geo_edges:
+#                 continue  # 尖锐边：切断
+#             if len(fids) >= 2:
+#                 base = fids[0]
+#                 for other in fids[1:]:
+#                     union(base, other)
+
+#         groups = defaultdict(list)
+#         for fid in fl:
+#             groups[find(int(fid))].append(int(fid))
+
+#         # 只有真的被“尖锐边切开”成 >=2 个面簇才拆分
+#         if len(groups) >= 2:
+#             split_pids.add(int(pid))
+#             face_groups = list(groups.values())
+#             pid_to_face_groups[int(pid)] = face_groups
+
+#             # 每个面簇算一个“簇法向”（建议面积加权）
+#             g_normals = []
+#             for g in face_groups:
+#                 nsum = np.zeros(3, dtype=float)
+#                 wsum = 0.0
+#                 for fid in g:
+#                     w = _tri_area(fid)
+#                     nsum += w * cell_normals[int(fid)]
+#                     wsum += w
+#                 if wsum < 1e-12:
+#                     n = _normalize(np.mean(cell_normals[np.array(g, dtype=int)], axis=0))
+#                 else:
+#                     n = _normalize(nsum)
+#                 g_normals.append(n)
+#             pid_to_group_normals[int(pid)] = g_normals
+
+#     print(f"检测到需要拆分的尖锐边节点数量(按面簇): {len(split_pids)}")
+
+#     # 5.4 生成新的偏移节点：每个面簇 1 个节点（不再按每个面生成）
+#     new_nodes = []
+#     new_normals = []
+
+#     for pid in range(points.shape[0]):
+#         if pid not in split_pids:
+#             new_nodes.append(points[pid])
+#             new_normals.append(normals[pid])
+#             continue
+
+#         v = points[pid]
+#         face_groups = pid_to_face_groups[pid]
+#         group_normals = pid_to_group_normals[pid]
+#         K = len(face_groups)
+#         # face -> group index
+#         face_to_group = {}
+#         for gi, g in enumerate(face_groups):
+#             for fid in g:
+#                 face_to_group[int(fid)] = gi
+
+#         # 每个 group 的凸/凹投票（只统计跨 group 的 incident sharp edges）
+#         incident = pid_to_incident_edges.get(pid, [])
+#         group_is_convex = [None] * K
+#         for gi in range(K):
+#             votes = []
+#             for e in incident:
+#                 f1 = int(e['face1'])
+#                 f2 = int(e['face2'])
+#                 if (f1 in face_to_group) and (f2 in face_to_group) and (face_to_group[f1] != face_to_group[f2]):
+#                     if (face_to_group[f1] == gi) or (face_to_group[f2] == gi):
+#                         votes.append(_edge_is_convex_signed(e))
+#             if votes:
+#                 group_is_convex[gi] = (sum(votes) >= (len(votes) / 2.0))  # 多数投票
+
+#         for i in range(K):
+#             n_i = group_normals[i]
+#             others = [group_normals[j] for j in range(K) if j != i]
+
+#             # 优先用“切平面投影分离方向”（来自你的参考逻辑）
+#             d = _separate_dir_from_normals(n_i, others)
+
+#             # 兜底：如果分离方向退化，用“指向本组面簇质心方向”并投影到切平面
+#             if float(np.linalg.norm(d)) < 1e-12:
+#                 cg = np.mean(face_centroids[np.array(face_groups[i], dtype=int)], axis=0)
+#                 t = cg - v
+#                 t = t - float(np.dot(t, n_i)) * n_i  # 投影到切平面
+#                 if float(np.linalg.norm(t)) < 1e-12:
+#                     d = np.array([1.0, 0.0, 0.0], dtype=float)  # 最后兜底
+#                 else:
+#                     d = _normalize(t)
+#                 # ---------- 关键：凸边取负方向，凹边取正方向 ----------
+#                 if group_is_convex[i] is True:
+#                     d = -d  # 凸 => 负方向
+#                 # group_is_convex[i] is False => 凹 => 正方向（不变）
+#                 # None => 未判定，不处理
+
+#                 # ---------- 关键守护：确保 d 指向该面簇“内部” ----------
+#                 # 否则即便凸凹翻了，也可能跑出扇区导致“离面”
+#                 cg = np.mean(face_centroids[np.array(face_groups[i], dtype=int)], axis=0)
+#                 t_in = cg - v
+#                 t_in = t_in - float(np.dot(t_in, n_i)) * n_i  # 投影到切平面
+#                 if float(np.linalg.norm(t_in)) > 1e-12:
+#                     t_in = _normalize(t_in)
+#                     if float(np.dot(d, t_in)) < 0.0:
+#                         d = -d
+
+#             p_new = v + inset_dist * d
+#             new_nodes.append(p_new)
+#             new_normals.append(n_i)
+
+#     new_nodes = np.asarray(new_nodes, dtype=float)
+#     new_normals = np.asarray(new_normals, dtype=float)
+
     # 5. 尖锐边法向量分离（方案1）：只在尖锐边点上拆分，且按“尖锐边切断的一环面连通分量(面簇)”拆分
     #    —— 每个面簇生成 1 个节点 + 1 个法向（不再按每个面生成节点）
-
+    #
+    #    【本版本包含你要求的全部改动】
+    #    1) 偏移距离：每个点 = 0.02 * (该点一环最短边)，并加上限 cap = 0.05 * avg_len
+    #    2) 偏移方向：先用“切平面投影分离方向”，再用 凸/凹 (signed dihedral) 决定正负（仅 K==2 时）
+    #    3) 最后再做一次“朝本面簇内部”的方向校正，避免偏移跑出扇区
     # 5.0 准备：尖锐边集合（用几何点id构成key，避免 split 后点id不一致）
     sharp_geo_edges = set()
     for e in sharp_edges:
@@ -1248,6 +1477,14 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
         if gA == gB:
             continue
         sharp_geo_edges.add((gA, gB) if gA < gB else (gB, gA))
+
+    # 5.0.0 顶点 -> incident sharp edge records（用于凸/凹投票）
+    pid_to_incident_edges = collections.defaultdict(list)
+    for e in sharp_edges:
+        a = int(e['point1_idx'])
+        b = int(e['point2_idx'])
+        pid_to_incident_edges[a].append(e)
+        pid_to_incident_edges[b].append(e)
 
     # 5.0.1 工具函数
     def _normalize(v):
@@ -1259,8 +1496,7 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
         v0, v1, v2 = points[int(a)], points[int(b)], points[int(c)]
         return 0.5 * float(np.linalg.norm(np.cross(v1 - v0, v2 - v0)))
 
-    # 参考你给的 test_separate.py：将“其他法向合力”投影到当前法向切平面，取反方向作为分离方向
-    # （只用于决定偏移方向，不用于分组）
+    # 参考 test_separate.py：将“其他法向合力”投影到当前法向切平面，取反方向作为分离方向
     def _separate_dir_from_normals(n_target, n_others):
         n1 = _normalize(n_target)
         if not n_others:
@@ -1271,20 +1507,62 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
             return np.zeros(3, dtype=float)
         return _normalize(-v_proj)
 
-    # 5.1 计算偏移距离（你现在的“固定优先，小模型比例”的规则保留）
-    bbox_diag = np.linalg.norm(points.max(axis=0) - points.min(axis=0))
-    abs_inset = 1e-4
-    rel_inset = 1e-4
-    inset_dist = min(abs_inset, rel_inset * bbox_diag)
-    print(f"偏移距离: {inset_dist}")
+    # --- 凸/凹：用 signed dihedral 的符号判定（注意：若整体反了，把 CONVEX_SIGN 改成 -1 即可） ---
+    CONVEX_SIGN = +1  # 若你发现“凸/凹翻了”，只改这里为 -1
 
-    # 5.2 预计算面片质心（用于兜底方向/轻微向内移动）
+    def _edge_is_convex_signed(e):
+        """
+        返回 True=凸, False=凹
+        使用：s = dot(edge_dir, cross(n1, n2))
+        """
+        p1 = int(e['point1_idx'])
+        p2 = int(e['point2_idx'])
+        f1 = int(e['face1'])
+        f2 = int(e['face2'])
+
+        n1 = _normalize(cell_normals[f1])
+        n2 = _normalize(cell_normals[f2])
+        edge_dir = _normalize(points[p2] - points[p1])  # 稳定方向
+
+        s = float(np.dot(edge_dir, np.cross(n1, n2))) * CONVEX_SIGN
+        return s > 0.0
+
+    # 5.1 偏移距离：每点 = 2% * (一环最短边)，上限 cap = 0.05 * avg_len
+    min_edge_len = np.full(points.shape[0], np.inf, dtype=float)
+    for tri in faces:
+        a, b, c = int(tri[0]), int(tri[1]), int(tri[2])
+
+        lab = float(np.linalg.norm(points[a] - points[b]))
+        lbc = float(np.linalg.norm(points[b] - points[c]))
+        lca = float(np.linalg.norm(points[c] - points[a]))
+
+        if lab < min_edge_len[a]: min_edge_len[a] = lab
+        if lab < min_edge_len[b]: min_edge_len[b] = lab
+        if lbc < min_edge_len[b]: min_edge_len[b] = lbc
+        if lbc < min_edge_len[c]: min_edge_len[c] = lbc
+        if lca < min_edge_len[c]: min_edge_len[c] = lca
+        if lca < min_edge_len[a]: min_edge_len[a] = lca
+
+    # 兜底（理论上不会用到）
+    min_edge_len[~np.isfinite(min_edge_len)] = float(avg_len)
+
+    inset_ratio = 0.02
+    cap = 0.05 * float(avg_len)
+    inset_dist_vtx = inset_ratio * min_edge_len
+    inset_dist_vtx = np.minimum(inset_dist_vtx, cap)
+    inset_dist_vtx = np.maximum(inset_dist_vtx, 1e-12)
+
+    print(
+        f"偏移距离(2%最短边, cap=0.05*avg_len): "
+        f"min={inset_dist_vtx.min():.3e}, median={np.median(inset_dist_vtx):.3e}, "
+        f"max={inset_dist_vtx.max():.3e}, cap={cap:.3e}"
+    )
+
+    # 5.2 预计算面片质心（用于兜底方向/向面簇内部校正）
     face_centroids = np.mean(points[faces], axis=1)  # (n_faces, 3)
 
     # 5.3 对每个“尖锐边上的点 pid”，用尖锐边切断一环面，得到面簇（连通分量）
     #     两个面在 pid 处可连通 <=> 它们共享的边 (pid, q) 不是尖锐边
-    from collections import defaultdict
-
     pid_to_face_groups = {}     # pid -> [ [fid...], [fid...], ... ]
     pid_to_group_normals = {}   # pid -> [n0, n1, ...]
     split_pids = set()
@@ -1297,10 +1575,9 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
         gpid = int(inv[int(pid)])
 
         # 建 edge -> faces 映射（只看经过 pid 的两条边）
-        edge2faces = defaultdict(list)
+        edge2faces = collections.defaultdict(list)
         for fid in fl:
             tri = faces[int(fid)]
-            # tri 中除 pid 外的两个点
             for q in tri:
                 q = int(q)
                 if q == int(pid):
@@ -1332,7 +1609,7 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
                 for other in fids[1:]:
                     union(base, other)
 
-        groups = defaultdict(list)
+        groups = collections.defaultdict(list)
         for fid in fl:
             groups[find(int(fid))].append(int(fid))
 
@@ -1342,7 +1619,7 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
             face_groups = list(groups.values())
             pid_to_face_groups[int(pid)] = face_groups
 
-            # 每个面簇算一个“簇法向”（建议面积加权）
+            # 每个面簇算一个“簇法向”（面积加权）
             g_normals = []
             for g in face_groups:
                 nsum = np.zeros(3, dtype=float)
@@ -1371,26 +1648,61 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
             continue
 
         v = points[pid]
+        inset_dist = float(inset_dist_vtx[pid])  # ★每点偏移距离
         face_groups = pid_to_face_groups[pid]
         group_normals = pid_to_group_normals[pid]
         K = len(face_groups)
+
+        # face -> group index（用于凸/凹投票筛选跨组边）
+        face_to_group = {}
+        for gi, g in enumerate(face_groups):
+            for fid in g:
+                face_to_group[int(fid)] = gi
+
+        # 仅在 K==2 的“普通尖锐边”上判凸/凹并决定正负；junction(K>2) 跳过凸凹翻转
+        group_is_convex = [None] * K
+        if K == 2:
+            incident = pid_to_incident_edges.get(pid, [])
+            for gi in range(K):
+                votes = []
+                for e in incident:
+                    f1 = int(e['face1'])
+                    f2 = int(e['face2'])
+                    if (f1 in face_to_group) and (f2 in face_to_group) and (face_to_group[f1] != face_to_group[f2]):
+                        if (face_to_group[f1] == gi) or (face_to_group[f2] == gi):
+                            votes.append(_edge_is_convex_signed(e))
+                if votes:
+                    group_is_convex[gi] = (sum(votes) >= (len(votes) / 2.0))
 
         for i in range(K):
             n_i = group_normals[i]
             others = [group_normals[j] for j in range(K) if j != i]
 
-            # 优先用“切平面投影分离方向”（来自你的参考逻辑）
+            # 1) 主方向：切平面投影分离方向
             d = _separate_dir_from_normals(n_i, others)
 
-            # 兜底：如果分离方向退化，用“指向本组面簇质心方向”并投影到切平面
+            # 2) 兜底：若退化，用“指向本组面簇质心方向”并投影到切平面
             if float(np.linalg.norm(d)) < 1e-12:
                 cg = np.mean(face_centroids[np.array(face_groups[i], dtype=int)], axis=0)
                 t = cg - v
-                t = t - float(np.dot(t, n_i)) * n_i  # 投影到切平面
+                t = t - float(np.dot(t, n_i)) * n_i
                 if float(np.linalg.norm(t)) < 1e-12:
-                    d = np.array([1.0, 0.0, 0.0], dtype=float)  # 最后兜底
+                    d = np.array([1.0, 0.0, 0.0], dtype=float)
                 else:
                     d = _normalize(t)
+
+            # 3) 凸/凹决定正负（仅 K==2）：凸边取负方向，凹边取正方向
+            if (K == 2) and (group_is_convex[i] is True):
+                d = -d
+
+            # 4) 关键守护：确保 d 指向本面簇“内部”（避免偏移跑出扇区）
+            cg = np.mean(face_centroids[np.array(face_groups[i], dtype=int)], axis=0)
+            t_in = cg - v
+            t_in = t_in - float(np.dot(t_in, n_i)) * n_i
+            if float(np.linalg.norm(t_in)) > 1e-12:
+                t_in = _normalize(t_in)
+                if float(np.dot(d, t_in)) < 0.0:
+                    d = -d
 
             p_new = v + inset_dist * d
             new_nodes.append(p_new)
@@ -1398,6 +1710,7 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
 
     new_nodes = np.asarray(new_nodes, dtype=float)
     new_normals = np.asarray(new_normals, dtype=float)
+
 
     print(f"原始节点数量: {points.shape[0]}")
     print(f"新节点数量: {new_nodes.shape[0]}")
