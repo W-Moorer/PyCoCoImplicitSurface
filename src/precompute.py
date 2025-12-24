@@ -15,7 +15,6 @@ precompute_single.py
 - 需要依赖：numpy、pyvista、scipy，以及 util.curlfree_poly（若不存在则尝试 cfpurecon.curlfree_poly）。
 """
 import os
-import pickle
 import json
 import collections
 import itertools
@@ -1084,7 +1083,7 @@ def _compute_radii(nodes, patches, feature_count, r_small, r_large, n_min=8):
         radii[i] = max(base, dn)
     return radii
 
-def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_factor=0.5, r_large_factor=3.0, edge_split_threshold=None, require_step_face_id_diff=False, sharp_edges_pkl=None):
+def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_factor=0.5, r_large_factor=3.0, edge_split_threshold=None, require_step_face_id_diff=False):
     """
     构建CFPU输入数据，根据用户需求：
     1. 不补充额外节点，只使用原始三角网格顶点
@@ -1100,22 +1099,7 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
     avg_len = _avg_edge_length(points, faces)
     
     # 1. 检测尖锐边和尖锐顶点
-    sharp_edges = None
-    if sharp_edges_pkl is None:
-        base = os.path.splitext(os.path.basename(input_path))[0]
-        cand = os.path.join(os.path.dirname(input_path), base + '_segmented_sharp_edges.pkl')
-        if os.path.exists(cand):
-            sharp_edges_pkl = cand
-    if sharp_edges_pkl is not None and os.path.exists(sharp_edges_pkl):
-        try:
-            with open(sharp_edges_pkl, 'rb') as f:
-                data = pickle.load(f)
-                if isinstance(data, dict) and 'sharp_edges' in data:
-                    sharp_edges = data['sharp_edges']
-        except Exception:
-            sharp_edges = None
-    if sharp_edges is None:
-        sharp_edges, _lines = detect_sharp_edges(mesh, angle_threshold=angle_threshold, edge_split_threshold=edge_split_threshold, require_step_face_id_diff=require_step_face_id_diff)
+    sharp_edges, _lines = detect_sharp_edges(mesh, angle_threshold=angle_threshold, edge_split_threshold=edge_split_threshold, require_step_face_id_diff=require_step_face_id_diff)
     
     # 收集尖锐顶点ID
     sharp_vertex_ids = set()
@@ -1910,22 +1894,11 @@ def segment_mesh(input_path, output_path, angle_threshold=30.0, edge_split_thres
     base_name = output_path.rsplit('.', 1)[0]
     
     # 保存区域邻接关系
-    output_pkl = base_name + '_adjacency.pkl'
     adj = classify_adjacency(mapped_labels, cell_normals, edge_to_faces)
     mesh.save(output_path)
-    with open(output_pkl, 'wb') as f:
-        pickle.dump(dict(adj), f)
     
     # 检测尖锐边缘
     sharp_edges, sharp_edge_lines = detect_sharp_edges(mesh, angle_threshold, edge_split_threshold, require_step_face_id_diff)
-    
-    # 保存尖锐边缘信息
-    sharp_pkl = base_name + '_sharp_edges.pkl'
-    with open(sharp_pkl, 'wb') as f:
-        pickle.dump({'sharp_edges': sharp_edges, 'sharp_edge_lines': sharp_edge_lines, 
-                     'num_sharp_edges': len(sharp_edges), 
-                     'convex_count': sum(1 for e in sharp_edges if e['is_convex']), 
-                     'concave_count': sum(1 for e in sharp_edges if not e['is_convex'])}, f)
     
     # 检测尖锐连接点和生成间断点信息
     junctions = detect_sharp_junctions_degree(mesh, sharp_edges)
@@ -1935,18 +1908,6 @@ def segment_mesh(input_path, output_path, angle_threshold=30.0, edge_split_thres
     turn_points = set()
     for seg in segments:
         turn_points.update(seg['turn_splits'])
-    
-    # 保存尖锐边缘片段和间断点信息
-    segments_pkl = base_name + '_sharp_segments.pkl'
-    with open(segments_pkl, 'wb') as f:
-        pickle.dump({
-            'segments': segments,
-            'junctions': list(junctions),
-            'turn_points': list(turn_points),
-            'num_segments': len(segments),
-            'num_junctions': len(junctions),
-            'num_turn_points': len(turn_points)
-        }, f)
     
     return adj
 

@@ -2,19 +2,13 @@ import argparse
 import os
 import numpy as np
 import pyvista as pv
-import pickle
 import json
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from src.precompute import read_mesh, detect_sharp_edges, detect_sharp_junctions_degree
 
-def load_sharp_edges(mesh, path_pkl, angle_threshold, edge_split_threshold, require_step_face_id_diff):
-    if path_pkl and os.path.exists(path_pkl):
-        with open(path_pkl, 'rb') as f:
-            d = pickle.load(f)
-        edges = d.get('sharp_edges', [])
-        lines = d.get('sharp_edge_lines', [])
-        return edges, lines
+def load_sharp_edges(mesh, angle_threshold, edge_split_threshold, require_step_face_id_diff):
+    # 直接计算尖锐边缘，不再加载pkl文件
     edges, lines = detect_sharp_edges(mesh, angle_threshold=angle_threshold, edge_split_threshold=edge_split_threshold, require_step_face_id_diff=require_step_face_id_diff)
     return edges, lines
 
@@ -37,7 +31,7 @@ def build_lines_poly(lines, colors):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', required=True)
-    ap.add_argument('--sharp_edges_pkl', default=None)
+    # 移除sharp_edges_pkl参数
     ap.add_argument('--angle_threshold', type=float, default=30.0)
     ap.add_argument('--edge_split_threshold', type=float, default=None)
     ap.add_argument('--require_step_face_id_diff', action='store_true')
@@ -50,7 +44,8 @@ def main():
     ap.add_argument('--screenshot', default=None)
     args = ap.parse_args()
     mesh = read_mesh(args.input, compute_split_normals=False)
-    edges, edge_lines = load_sharp_edges(mesh, args.sharp_edges_pkl, args.angle_threshold, args.edge_split_threshold, args.require_step_face_id_diff)
+    # 调用修改后的load_sharp_edges函数，不再传入pkl路径
+    edges, edge_lines = load_sharp_edges(mesh, args.angle_threshold, args.edge_split_threshold, args.require_step_face_id_diff)
     junctions = detect_sharp_junctions_degree(mesh, edges)
     colors = []
     for e in edges:

@@ -86,13 +86,12 @@ def main():
     # 8. 运行可视化脚本，生成包含间断点的可视化结果
     print("生成包含间断点的可视化结果...")
     screenshot_path = os.path.join(output_dir, "sharp_edges_with_turn_points.png")
-    sharp_edges_pkl = os.path.join(output_dir, "zuheti_surface_cellnormals_segmented_sharp_edges.pkl")
     
-    # 使用系统命令运行可视化脚本
-    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --angle_threshold {angle_threshold} --sharp_edges_pkl {sharp_edges_pkl} --segments_debug {segments_debug_path} --off_screen --screenshot {screenshot_path}"
+    # 使用系统命令运行可视化脚本，移除sharp_edges_pkl参数
+    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --angle_threshold {angle_threshold} --segments_debug {segments_debug_path} --off_screen --screenshot {screenshot_path}"
     os.system(cmd)
 
-    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --angle_threshold {angle_threshold} --sharp_edges_pkl {sharp_edges_pkl} --segments_debug {segments_debug_path}"
+    cmd = f"python visualize/visualize_sharp_edges_junctions.py --input {input_path} --angle_threshold {angle_threshold} --segments_debug {segments_debug_path}"
     os.system(cmd)
     
     print("\n自动化处理完成！")

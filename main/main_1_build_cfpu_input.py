@@ -24,7 +24,6 @@ def main():
     ap.add_argument('--r_large_factor', type=float, default=3.0)
     ap.add_argument('--edge_split_threshold', type=float, default=None)
     ap.add_argument('--require_step_face_id_diff', action='store_true')
-    ap.add_argument('--sharp_edges_pkl', type=str, default=None)
     args = ap.parse_args()
     inputs = args.inputs
     if not inputs:
@@ -49,7 +48,9 @@ def main():
     for inp in inputs:
         base = os.path.splitext(os.path.basename(inp))[0]
         out_dir = os.path.join(args.out_root, base + '_cfpu_input')
-        build_cfpu_input(inp, out_dir, args.angle_threshold, args.r_small_factor, args.r_large_factor, args.edge_split_threshold, args.require_step_face_id_diff, args.sharp_edges_pkl)
+        build_cfpu_input(inp, out_dir, args.angle_threshold, args.r_small_factor, args.r_large_factor, args.edge_split_threshold, args.require_step_face_id_diff)
 
 if __name__ == '__main__':
     main()
+
+
