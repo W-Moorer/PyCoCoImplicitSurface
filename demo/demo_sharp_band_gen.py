@@ -20,6 +20,12 @@ except ImportError:
     print("错误: 无法导入 src.precompute。")
     sys.exit(1)
 
+def _safe_normalize(v):
+    n = np.linalg.norm(v)
+    if n < 1e-12:
+        return np.zeros_like(v)
+    return v / n
+
 # ==============================================================================
 # 1. 辅助工具
 # ==============================================================================
@@ -30,35 +36,29 @@ def extract_faces_and_centroids(mesh):
     centroids = face_pts.mean(axis=1)
     return faces, centroids
 
-def check_convexity_signed(p1, p2, n1, n2):
-    edge = p2 - p1
-    edge /= (np.linalg.norm(edge) + 1e-12)
-    s = np.dot(edge, np.cross(n1, n2))
-    return "convex" if s > 0 else "concave"
+def check_convexity_robust(p1, p2, n1, n2, c1, c2):
+    """
+    稳健的凹凸性判定:
+    - 凸边(Convex): Face 2 向下折弯，C2 在 Face 1 平面下方 (dot < 0)
+    - 凹边(Concave): Face 2 向上折弯，C2 在 Face 1 平面上方 (dot > 0)
+    """
+    mid = (p1 + p2) * 0.5
+    dist = np.dot(c2 - mid, n1)
+    # 为了防止数值噪音，可以加一个小阈值，或者结合双向判定
+    return "convex" if dist < 0 else "concave"
 
 # ==============================================================================
-# 2. 【核心修复】Monkey Patch: 恢复 Turn Angle 切断逻辑
+# 2. Monkey Patch: Segments 构建
 # ==============================================================================
 def build_sharp_segments_fixed_turn(edges, junctions, points, cell_normals=None, angle_turn_threshold=90.0):
-    """
-    修复版组装逻辑：
-    1. 包含 Turn Angle 检测：遇到尖角(>threshold)必须断开。
-    2. 包含闭环检测：如果首尾重合，标记为 Closed。
-    """
-    # 辅助：计算转折角 (0~180度)
     def calculate_turn_angle(prev_idx, cur_idx, next_idx):
         v1 = points[cur_idx] - points[prev_idx]
         v2 = points[next_idx] - points[cur_idx]
         n1 = np.linalg.norm(v1)
         n2 = np.linalg.norm(v2)
-        if n1 < 1e-12 or n2 < 1e-12:
-            return 0.0
-        v1 /= n1
-        v2 /= n2
+        if n1 < 1e-12 or n2 < 1e-12: return 0.0
+        v1 /= n1; v2 /= n2
         dot = np.clip(np.dot(v1, v2), -1.0, 1.0)
-        # dot=1 -> 0度(直线), dot=0 -> 90度, dot=-1 -> 180度(回头)
-        # 我们需要的是偏转角。acos(dot) 是两向量夹角。
-        # 如果是直线，v1和v2同向，dot=1，acos=0。
         return np.degrees(np.arccos(dot))
 
     adj = {}
@@ -70,91 +70,47 @@ def build_sharp_segments_fixed_turn(edges, junctions, points, cell_normals=None,
     visited = set()
     segments = []
 
-    # --- Stage 1: 从端点/Junction出发 ---
     starts = [p for p in adj.keys() if (p in junctions) or (len(adj[p]) != 2)]
     
     for s in starts:
-        # 可能有多个方向从 s 出发
         for start_edge_idx in list(adj[s]):
-            if start_edge_idx in visited:
-                continue
-            
-            # 初始化路径
+            if start_edge_idx in visited: continue
             path = [s]
             curr_edge_idx = start_edge_idx
             visited.add(curr_edge_idx)
-            
             e_obj = edges[curr_edge_idx]
             u, v = int(e_obj['point1_idx']), int(e_obj['point2_idx'])
             curr = v if u == s else u
             prev = s
             path.append(curr)
-            seg_edges = [e_obj]
-            turn_splits = []
-
-            # 路径追踪
+            
             while True:
-                # 停止条件1：遇到 Junction 或 端点
-                if (curr in junctions) or (len(adj[curr]) != 2):
-                    break
-                # 停止条件2：回到起点
-                if curr == s:
-                    break
-                
-                # 找下一条边 (度数为2，必有一条未访问或是回头路)
-                # 注意：这里需要预判一下转折角，如果有多个选择（极少见），选最直的
-                candidates = []
-                for ne_idx in adj[curr]:
-                    if ne_idx != curr_edge_idx: # 不走回头路
-                        candidates.append(ne_idx)
-                
-                if not candidates:
-                    break
-
-                # 选择最佳下一条边（通常只有1条，但在拓扑异常处可能有重叠）
-                best_next = None
-                best_angle = 1e9
-                
-                # 确定 next node 坐标来算角度
+                if (curr in junctions) or (len(adj[curr]) != 2) or (curr == s): break
+                candidates = [ne for ne in adj[curr] if ne != curr_edge_idx]
+                if not candidates: break
+                best_next = None; best_angle = 1e9
                 for ne_idx in candidates:
                     e_next = edges[ne_idx]
                     nu, nv = int(e_next['point1_idx']), int(e_next['point2_idx'])
                     nxt_node = nv if nu == curr else nu
-                    
                     ang = calculate_turn_angle(prev, curr, nxt_node)
-                    if ang < best_angle:
-                        best_angle = ang
-                        best_next = ne_idx
-
-                # 【修复逻辑】：检查转折角
-                if best_next is not None:
-                    # 如果转折角太大，强制断开！
-                    if best_angle > angle_turn_threshold:
-                        # print(f"  [Break] Sharp Turn detected: {best_angle:.1f}° at node {curr}")
-                        turn_splits.append(curr)
-                        break # <--- 必须 break，形成开环线段
-                    
-                    # 否则继续走
-                    next_edge_idx = best_next
-                    if next_edge_idx in visited:
-                        break # 闭环接上了已访问的部分
-
-                    visited.add(next_edge_idx)
-                    curr_edge_idx = next_edge_idx
-                    e_obj = edges[curr_edge_idx]
-                    u, v = int(e_obj['point1_idx']), int(e_obj['point2_idx'])
-                    
-                    prev = curr # 更新 prev
-                    curr = v if u == curr else u
-                    path.append(curr)
-                    seg_edges.append(e_obj)
-                else:
-                    break
+                    if ang < best_angle: best_angle = ang; best_next = ne_idx
+                
+                if best_next is None: break
+                if best_angle > angle_turn_threshold: break 
+                
+                if best_next in visited: break
+                visited.add(best_next)
+                curr_edge_idx = best_next
+                e_obj = edges[curr_edge_idx]
+                u, v = int(e_obj['point1_idx']), int(e_obj['point2_idx'])
+                prev = curr
+                curr = v if u == curr else u
+                path.append(curr)
 
             is_closed = (len(path) > 2 and path[0] == path[-1])
-            segments.append({'vertices': path, 'edges': seg_edges, 'closed': is_closed, 'turn_splits': turn_splits})
+            segments.append({'vertices': path, 'closed': is_closed})
 
-    # --- Stage 2: 剩余的完美闭环 ---
     all_indices = set(range(len(edges)))
     remaining = all_indices - visited
     while remaining:
@@ -162,41 +118,25 @@ def build_sharp_segments_fixed_turn(edges, junctions, points, cell_normals=None,
         visited.add(start_idx)
         e_obj = edges[start_idx]
         u, v = int(e_obj['point1_idx']), int(e_obj['point2_idx'])
-        
         path = [u, v]
         prev = u
         curr = v
         curr_idx = start_idx
-        seg_edges = [e_obj]
-        turn_splits = []
-        
         while True:
-            # 找下一条
             candidates = [ne for ne in adj[curr] if ne != curr_idx]
             if not candidates: break
-
-            # 计算角度选路
-            best_next = None
-            best_angle = 1e9
+            best_next = None; best_angle = 1e9
             for ne_idx in candidates:
                 e_next = edges[ne_idx]
                 nu, nv = int(e_next['point1_idx']), int(e_next['point2_idx'])
                 nxt_node = nv if nu == curr else nu
                 ang = calculate_turn_angle(prev, curr, nxt_node)
-                if ang < best_angle:
-                    best_angle = ang
-                    best_next = ne_idx
+                if ang < best_angle: best_angle = ang; best_next = ne_idx
             
             if best_next is None: break
+            if best_angle > angle_turn_threshold: break 
 
-            # 【修复逻辑】：Stage 2 也要检查转折
-            if best_angle > angle_turn_threshold:
-                 turn_splits.append(curr)
-                 break # 闭环因为尖角被切断成开环
-
-            if best_next in visited:
-                break
-            
+            if best_next in visited: break
             visited.add(best_next)
             remaining.discard(best_next)
             curr_idx = best_next
@@ -205,131 +145,226 @@ def build_sharp_segments_fixed_turn(edges, junctions, points, cell_normals=None,
             prev = curr
             curr = v if u == curr else u
             path.append(curr)
-            seg_edges.append(e_obj)
             
         is_closed = (len(path) > 2 and path[0] == path[-1])
-        segments.append({'vertices': path, 'edges': seg_edges, 'closed': is_closed, 'turn_splits': turn_splits})
+        segments.append({'vertices': path, 'closed': is_closed})
 
     return segments
 
-# 覆盖原模块函数
 precompute_module.build_sharp_segments = build_sharp_segments_fixed_turn
 
 # ==============================================================================
-# 3. 拟合与重采样 (保持不变)
+# 3. 法向对齐与顶点平均
 # ==============================================================================
-def fit_and_resample(seg, points, step):
-    verts = seg['vertices']
-    raw = points[verts]
-    if len(raw) < 2: return None, None, None, None, None
+def compute_aligned_vertex_normals(vert_ids, edge_map, cell_normals, is_closed):
+    raw_edge_normals = [] 
+    for i in range(len(vert_ids) - 1):
+        u, v = vert_ids[i], vert_ids[i+1]
+        key = tuple(sorted((u, v)))
+        edge = edge_map.get(key)
+        if edge:
+            f1, f2 = int(edge['face1']), int(edge['face2'])
+            n1 = cell_normals[f1]
+            n2 = cell_normals[f2]
+            raw_edge_normals.append((n1, n2))
+        else:
+            raw_edge_normals.append((np.array([0,0,1.0]), np.array([0,0,1.0])))
+
+    if not raw_edge_normals: return None, None
+
+    aligned_edge_normals = []
+    prev_n1, prev_n2 = raw_edge_normals[0]
+    aligned_edge_normals.append((prev_n1, prev_n2))
     
-    dists = np.linalg.norm(raw[1:] - raw[:-1], axis=1)
+    for i in range(1, len(raw_edge_normals)):
+        curr_n1, curr_n2 = raw_edge_normals[i]
+        dist_direct = np.linalg.norm(curr_n1 - prev_n1) + np.linalg.norm(curr_n2 - prev_n2)
+        dist_swap   = np.linalg.norm(curr_n1 - prev_n2) + np.linalg.norm(curr_n2 - prev_n1)
+        if dist_swap < dist_direct:
+            curr_n1, curr_n2 = curr_n2, curr_n1
+        aligned_edge_normals.append((curr_n1, curr_n2))
+        prev_n1, prev_n2 = curr_n1, curr_n2
+
+    vn1_list = []
+    vn2_list = []
+    num_verts = len(vert_ids)
+    num_edges = len(aligned_edge_normals)
+    
+    for i in range(num_verts):
+        inc_n1 = []
+        inc_n2 = []
+        
+        # 入边
+        if i > 0:
+            en1, en2 = aligned_edge_normals[i-1]
+            inc_n1.append(en1); inc_n2.append(en2)
+        elif is_closed: 
+            last_n1, last_n2 = aligned_edge_normals[-1]
+            first_n1, first_n2 = aligned_edge_normals[0]
+            dist_direct = np.linalg.norm(last_n1 - first_n1) + np.linalg.norm(last_n2 - first_n2)
+            dist_swap   = np.linalg.norm(last_n1 - first_n2) + np.linalg.norm(last_n2 - first_n1)
+            if dist_swap < dist_direct:
+                inc_n1.append(last_n2); inc_n2.append(last_n1)
+            else:
+                inc_n1.append(last_n1); inc_n2.append(last_n2)
+        
+        # 出边
+        if i < num_edges:
+            en1, en2 = aligned_edge_normals[i]
+            inc_n1.append(en1); inc_n2.append(en2)
+        elif is_closed:
+            en1, en2 = aligned_edge_normals[0]
+            inc_n1.append(en1); inc_n2.append(en2)
+            
+        if inc_n1:
+            avg_n1 = np.mean(inc_n1, axis=0)
+            avg_n2 = np.mean(inc_n2, axis=0)
+            vn1_list.append(_safe_normalize(avg_n1))
+            vn2_list.append(_safe_normalize(avg_n2))
+        else:
+            vn1_list.append(np.array([0,0,1.0]))
+            vn2_list.append(np.array([0,0,1.0]))
+            
+    return np.array(vn1_list), np.array(vn2_list)
+
+# ==============================================================================
+# 4. 拟合与重采样
+# ==============================================================================
+def fit_and_resample_segment_advanced(segment_points_ids, mesh_points, step_size, is_closed=False, edge_data_map=None, cell_normals=None):
+    raw_points = mesh_points[segment_points_ids]
+    n_raw = raw_points.shape[0]
+    if n_raw < 2: return None, None, None, None, None, None
+
+    dists = np.linalg.norm(raw_points[1:] - raw_points[:-1], axis=1)
     u_cum = np.concatenate(([0], np.cumsum(dists)))
-    total = u_cum[-1]
-    if total < 1e-9: return None, None, None, None, None
-    t = u_cum / total
-    
-    k = min(3, len(raw)-1)
+    total_length = u_cum[-1]
+    if total_length < 1e-12: return None, None, None, None, None, None
+    t_params = u_cum / total_length
+
+    vn1_arr, vn2_arr = compute_aligned_vertex_normals(segment_points_ids, edge_data_map, cell_normals, is_closed)
+    if vn1_arr is None: return None, None, None, None, None, None
+
+    k = min(3, n_raw - 1)
     try:
-        tck, _ = splprep(raw.T, u=t, s=0.0, k=k, per=1 if seg['closed'] else 0)
-    except:
-        tck, _ = splprep(raw.T, u=t, s=0.0, k=1, per=0)
-        
-    n_samp = max(2, int(np.ceil(total/step)))
-    u_new = np.linspace(0, 1, n_samp, endpoint=True)
-    pts = np.array(splev(u_new, tck)).T
-    ders = np.array(splev(u_new, tck, der=1)).T
-    norms = np.linalg.norm(ders, axis=1)[:,None]
-    norms[norms<1e-12] = 1.0
-    tans = ders / norms
+        tck_pos, _ = splprep(raw_points.T, u=t_params, s=0.0, k=k, per=1 if is_closed else 0)
+        tck_n1, _  = splprep(vn1_arr.T, u=t_params, s=0.0, k=k, per=1 if is_closed else 0)
+        tck_n2, _  = splprep(vn2_arr.T, u=t_params, s=0.0, k=k, per=1 if is_closed else 0)
+    except Exception:
+        tck_pos, _ = splprep(raw_points.T, u=t_params, s=0.0, k=1, per=0)
+        tck_n1, _  = splprep(vn1_arr.T, u=t_params, s=0.0, k=1, per=0)
+        tck_n2, _  = splprep(vn2_arr.T, u=t_params, s=0.0, k=1, per=0)
+
+    num_samples = max(2, int(np.ceil(total_length / step_size)))
+    u_new = np.linspace(0, 1, num_samples, endpoint=True)
+
+    new_points = np.array(splev(u_new, tck_pos)).T
+    derivatives = np.array(splev(u_new, tck_pos, der=1)).T
+    tangents = np.array([_safe_normalize(d) for d in derivatives])
+
+    raw_res_n1 = np.array(splev(u_new, tck_n1)).T
+    raw_res_n2 = np.array(splev(u_new, tck_n2)).T
     
-    return pts, tans, t, verts, u_new
+    res_n1 = np.array([_safe_normalize(n) for n in raw_res_n1])
+    res_n2 = np.array([_safe_normalize(n) for n in raw_res_n2])
+
+    return new_points, tangents, res_n1, res_n2, t_params, u_new
 
 # ==============================================================================
-# 4. 计算 Band Points (包含法向一致性修复)
+# 5. 生成 Band Points (基于凹凸性的几何定向)
 # ==============================================================================
-def compute_band_points_consistent(new_pts, new_tans, t_raw, v_raw, u_new, 
-                                   edge_map, cell_normals, face_centroids, 
-                                   mesh_points, offset):
+def compute_band_points_geometric(new_pts, new_tans, n1s, n2s, 
+                                  t_raw, vert_ids_raw, u_new, 
+                                  edge_map, cell_normals, face_centroids, 
+                                  mesh_points, offset):
+    """
+    【核心改进】
+    废弃全局投票，改用“凹凸性+另一侧法向”的局部几何约束。
+    - 对于凸边(Convex): Side 1 偏移应大致反向于 Side 2 法向量的投影。
+    - 对于凹边(Concave): Side 1 偏移应大致同向于 Side 2 法向量的投影。
+    """
     idx_intervals = np.searchsorted(t_raw, u_new, side='right') - 1
-    idx_intervals = np.clip(idx_intervals, 0, len(v_raw) - 2)
+    idx_intervals = np.clip(idx_intervals, 0, len(vert_ids_raw) - 2)
 
-    p1_list, n1_list = [], []
-    p2_list, n2_list = [], []
+    final_p1s = []
+    final_p2s = []
     convexity_flags = []
+    
+    # 临时缓存上一帧的凸凹状态，防止在个别点计算失败时抖动
+    last_convexity = "convex" 
 
-    prev_n1 = None
-    prev_n2 = None
-
-    for i, idx in enumerate(idx_intervals):
+    for i in range(len(new_pts)):
         curr_p = new_pts[i]
-        curr_t = new_tans[i]
+        t = new_tans[i]
+        n1 = n1s[i]
+        n2 = n2s[i]
         
-        v_a = v_raw[idx]
-        v_b = v_raw[idx+1]
+        # 1. 计算基准偏移向量 (在切平面内，垂直于t)
+        e1 = np.cross(t, n1)
+        if np.linalg.norm(e1) < 1e-6: e1 = np.cross(t, n2)
+        e1 = _safe_normalize(e1)
         
+        e2 = np.cross(n2, t)
+        if np.linalg.norm(e2) < 1e-6: e2 = np.cross(n1, t)
+        e2 = _safe_normalize(e2)
+
+        # 2. 获取原始几何信息以判断凹凸
+        idx = idx_intervals[i]
+        v_a = vert_ids_raw[idx]
+        v_b = vert_ids_raw[idx+1]
         key = tuple(sorted((v_a, v_b)))
         edge = edge_map.get(key)
         
-        if not edge:
-            n1 = prev_n1 if prev_n1 is not None else np.array([0,0,1.0])
-            n2 = prev_n2 if prev_n2 is not None else np.array([0,0,1.0])
-            c1, c2 = curr_p, curr_p
-            is_convex = "unknown"
-        else:
+        is_convex = last_convexity
+        if edge:
             f1, f2 = int(edge['face1']), int(edge['face2'])
-            n_candidate_A = cell_normals[f1]
-            n_candidate_B = cell_normals[f2]
-            c_candidate_A = face_centroids[f1]
-            c_candidate_B = face_centroids[f2]
-            
-            # --- 法向一致性对齐 ---
-            if prev_n1 is None:
-                n1, n2 = n_candidate_A, n_candidate_B
-                c1, c2 = c_candidate_A, c_candidate_B
-            else:
-                dist_direct = np.linalg.norm(n_candidate_A - prev_n1) + np.linalg.norm(n_candidate_B - prev_n2)
-                dist_swap   = np.linalg.norm(n_candidate_A - prev_n2) + np.linalg.norm(n_candidate_B - prev_n1)
-                
-                if dist_swap < dist_direct:
-                    n1, n2 = n_candidate_B, n_candidate_A
-                    c1, c2 = c_candidate_B, c_candidate_A
-                else:
-                    n1, n2 = n_candidate_A, n_candidate_B
-                    c1, c2 = c_candidate_A, c_candidate_B
-
-            is_convex = check_convexity_signed(mesh_points[v_a], mesh_points[v_b], n1, n2)
-
-        prev_n1 = n1
-        prev_n2 = n2
+            raw_n1 = cell_normals[f1]
+            raw_n2 = cell_normals[f2]
+            c1, c2 = face_centroids[f1], face_centroids[f2]
+            # 判定凹凸
+            is_convex = check_convexity_robust(mesh_points[v_a], mesh_points[v_b], raw_n1, raw_n2, c1, c2)
+            last_convexity = is_convex
+        
         convexity_flags.append(is_convex)
 
-        # 偏移计算
-        e1 = np.cross(curr_t, n1) 
-        e2 = np.cross(n2, curr_t)
+        # 3. 几何定向修正
+        # Side 1 修正:
+        # 投影 N2 到 Side 1 平面: proj_n2 = N2 - (N2.N1)N1
+        # 但我们这里的 N1, N2 已经是正交化的 B 样条结果，直接用点积判断即可。
+        # 理想方向:
+        #   Convex: 指向 -N2 (投影后)
+        #   Concave: 指向 +N2 (投影后)
         
-        vn1 = np.linalg.norm(e1)
-        if vn1 < 1e-6: e1 = np.cross(curr_t, n2)
-        else: e1 /= vn1
+        # 计算 e1 与 n2 的对齐度
+        # 如果 Convex, e1 应该与 n2 夹角 > 90度 (dot < 0)
+        # 如果 Concave, e1 应该与 n2 夹角 < 90度 (dot > 0)
         
-        vn2 = np.linalg.norm(e2)
-        if vn2 < 1e-6: e2 = np.cross(n1, curr_t)
-        else: e2 /= vn2
+        dot_1 = np.dot(e1, n2)
+        
+        flip_1 = 1.0
+        if is_convex == "convex":
+            # 期望反向 (dot < 0)。如果 dot > 0，说明反了，需要翻转
+            if dot_1 > 0: flip_1 = -1.0
+        else:
+            # 期望同向 (dot > 0)。如果 dot < 0，说明反了
+            if dot_1 < 0: flip_1 = -1.0
+            
+        # Side 2 修正 (对称逻辑):
+        # Convex: e2 应该背离 n1 -> dot(e2, n1) < 0
+        dot_2 = np.dot(e2, n1)
+        
+        flip_2 = 1.0
+        if is_convex == "convex":
+            if dot_2 > 0: flip_2 = -1.0
+        else:
+            if dot_2 < 0: flip_2 = -1.0
 
-        if np.dot(c1 - curr_p, e1) < 0: e1 = -e1
-        if np.dot(c2 - curr_p, e2) < 0: e2 = -e2
+        final_p1s.append(curr_p + offset * e1 * flip_1)
+        final_p2s.append(curr_p + offset * e2 * flip_2)
 
-        p1_list.append(curr_p + offset * e1)
-        n1_list.append(n1)
-        p2_list.append(curr_p + offset * e2)
-        n2_list.append(n2)
-
-    return (np.array(p1_list), np.array(n1_list), 
-            np.array(p2_list), np.array(n2_list), 
-            convexity_flags)
+    return np.array(final_p1s), n1s, np.array(final_p2s), n2s, convexity_flags
 
 # ==============================================================================
-# 5. 主程序
+# 6. 主程序
 # ==============================================================================
 def main():
     parser = argparse.ArgumentParser()
@@ -337,9 +372,12 @@ def main():
     parser.add_argument('--step', type=float, default=0.05)
     parser.add_argument('--offset', type=float, default=0.02)
     parser.add_argument('--angle', type=float, default=40.0)
-    # 默认阈值设为 60 或 90 度，确保直角处断开
-    parser.add_argument('--turn_angle', type=float, default=60.0, help="Turn split threshold")
+    parser.add_argument('--turn_angle', type=float, default=90.0)
     args = parser.parse_args()
+
+    if not os.path.exists(args.input):
+        print("File not found")
+        return
 
     print(f"Reading: {args.input}")
     mesh = read_mesh(args.input)
@@ -355,7 +393,6 @@ def main():
     cell_normals = mesh.cell_data.get('Normals', mesh.cell_data.get('cell_normals'))
     faces_arr, face_centroids = extract_faces_and_centroids(mesh)
 
-    # 构建 Segments (包含修复后的 Turn Check)
     print(f"Building Segments (Turn Threshold = {args.turn_angle} deg)...")
     segments = precompute_module.build_sharp_segments(
         edges, junctions, mesh.points, cell_normals, 
@@ -370,17 +407,26 @@ def main():
     p = pv.Plotter()
     p.add_mesh(mesh, color='white', opacity=0.2, style='surface', show_edges=False)
 
-    print("Generating Bands...")
+    print("Generating Smooth Bands (Geometric Orientation)...")
     
     has_convex = False
     has_concave = False
 
     for seg in segments:
-        pts, tans, t, v, u_new = fit_and_resample(seg, mesh.points, args.step)
-        if pts is None: continue
+        res = fit_and_resample_segment_advanced(
+            seg['vertices'], mesh.points, args.step, 
+            is_closed=seg['closed'], 
+            edge_data_map=edge_map, 
+            cell_normals=cell_normals
+        )
+        
+        if res is None: continue
+        pts, tans, smooth_n1, smooth_n2, t_raw, u_new = res
 
-        p1, n1, p2, n2, flags = compute_band_points_consistent(
-            pts, tans, t, v, u_new,
+        # 【调用新的几何定向函数】
+        p1, n1, p2, n2, flags = compute_band_points_geometric(
+            pts, tans, smooth_n1, smooth_n2,
+            t_raw, seg['vertices'], u_new,
             edge_map, cell_normals, face_centroids, 
             mesh.points, args.offset
         )
@@ -391,7 +437,6 @@ def main():
         if color == 'orange': has_convex = True
         else: has_concave = True
         
-        # 绘制
         line = pv.lines_from_points(pts)
         p.add_mesh(line, color=color, line_width=4, render_lines_as_tubes=True)
         
@@ -405,7 +450,7 @@ def main():
         tmp2 = pv.PolyData(p2); tmp2['n'] = n2
         p.add_mesh(tmp2.glyph(orient='n', scale=False, factor=scale), color='cyan')
 
-    p.add_legend([['Convex', 'orange'], ['Concave', 'purple'], ['Side 1', 'gold'], ['Side 2', 'cyan']])
+    p.add_legend([['Convex', 'orange'], ['Concave', 'purple'], ['Side 1 (Smooth)', 'gold'], ['Side 2 (Smooth)', 'cyan']])
     print(f"Total Segments: {len(segments)}")
     p.show()
 
