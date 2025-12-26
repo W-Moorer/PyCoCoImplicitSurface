@@ -16,13 +16,13 @@ from src.precompute import read_mesh, detect_sharp_edges, detect_sharp_junctions
 
 def main():
     # 输入文件路径
-    input_path = r"input\complex_geometry\PressureLubricatedCam_surface_cellnormals.vtp"
+    input_path = r"input\complex_geometry\LinkedGear_surface_cellnormals.vtp"
     
     # 输出目录
-    output_dir = r"output\auto_turn_points\complex_geometry\PressureLubricatedCam_surface_cellnormals"
+    output_dir = r"output\auto_turn_points\complex_geometry\LinkedGear_surface_cellnormals"
     
     # 参数设置
-    angle_threshold = 45.0
+    angle_threshold = 35.0
     edge_split_threshold = None
     require_step_face_id_diff = False
     angle_turn_threshold = 90.0  # 间断点角度阈值

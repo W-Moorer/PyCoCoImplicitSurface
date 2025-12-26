@@ -11,10 +11,10 @@
 # 全局配置变量
 # 可以直接在此修改默认参数，无需使用命令行参数
 # =============================================================================
-DEFAULT_CFPU_DIR = r'output\cfpu_input\PressureLubricatedCam_surface_cellnormals_cfpu_input'  # 直接指定CFPU输入数据目录（空字符串表示使用菜单选择）
-DEFAULT_MODEL_NAME = 'PressureLubricatedCam'  # 直接指定模型名称（空字符串表示使用菜单选择）
+DEFAULT_CFPU_DIR = r'output\cfpu_input\LinkedGear_surface_cellnormals_cfpu_input'  # 直接指定CFPU输入数据目录（空字符串表示使用菜单选择）
+DEFAULT_MODEL_NAME = 'LinkedGear'  # 直接指定模型名称（空字符串表示使用菜单选择）
 DEFAULT_SHOW_MESH = False  # 是否默认显示原始OBJ网格
-DEFAULT_RECON_DIR = 'output/PressureLubricatedCam_recon_GPU'  # 直接指定重建结果目录（空字符串表示自动查找）
+DEFAULT_RECON_DIR = 'output/LinkedGear_recon_GPU'  # 直接指定重建结果目录（空字符串表示自动查找）
 DEFAULT_ISOSURFACE = 0.0  # 等值面值，默认为0.0
 DEFAULT_OPACITY = 0.7  # 重建曲面不透明度
 # =============================================================================

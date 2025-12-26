@@ -590,7 +590,9 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
               feature_mask=None, feature_scale=1.0, use_gpu=False,
               curve_points=None, curve_points_in_unit=False,
               curve_patch_map=None, curve_max_points_per_patch=200,
-              curve_only_feature_patches=True):
+              curve_only_feature_patches=True,
+              feature_tube_blend=False, feature_tube_tau=0.0
+):
     if kernelinfo is None:
         kernelinfo = {
             'phi': lambda r: -r,
@@ -637,6 +639,9 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
                 dists = np.linalg.norm(x[id_list, :] - y[k, :], axis=1)
                 nn_dist_list.append(dists)
         patchRad = np.full(M, patchRad0, dtype=float)
+        # feature patch mask（用于PU加权策略）
+        fm = np.asarray(feature_mask, dtype=bool)[:M] if feature_mask is not None else None
+
         nodeInPatch = np.zeros(N, dtype=bool)
         for k in range(M):
             nodeInPatch[idx[k]] = True
@@ -748,12 +753,14 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
     minx = np.min(x, axis=0)
     maxx = np.max(x, axis=0)
     griddx = np.max((maxx - minx) / gridsize)
-    startx = minx[0] - 3 * griddx
-    endx = maxx[0] + 3 * griddx
-    starty = minx[1] - 3 * griddx
-    endy = maxx[1] + 3 * griddx
-    startz = minx[2] - 3 * griddx
-    endz = maxx[2] + 3 * griddx
+    pad = 1.0 * griddx   # 或 0.5*griddx
+    startx = minx[0] - pad
+    endx   = maxx[0] + pad
+    starty = minx[1] - pad
+    endy   = maxx[1] + pad
+    startz = minx[2] - pad
+    endz   = maxx[2] + pad
+
     xx = np.arange(startx, endx + griddx/2, griddx)
     yy = np.arange(starty, endy + griddx/2, griddx)
     zz = np.arange(startz, endz + griddx/2, griddx)
@@ -1155,19 +1162,22 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         out_dtype = cp.float64 if dtype_env in ('float64', 'f64', 'double') else cp.float32
     else:
         out_dtype = np.float64
-
+    
+    # ====== 加权阶段：全patch Psi_sum + feature-only Psi_sum_feat ======
     Psi_sum = xp.zeros(m, dtype=out_dtype)
+    Psi_sum_feat = xp.zeros(m, dtype=out_dtype) if (feature_tube_blend and (fm is not None)) else None
 
-    # 1) 累计每个网格点的权重和 Psi_sum
+    # 1) 累计 Psi_sum（全patch）和 Psi_sum_feat（仅feature）
     for k in range(M):
         idxk = idxe_patch[k]
-        if idxk is None or getattr(idxk, 'size', 0) == 0:
+        if idxk is None or getattr(idxk, "size", 0) == 0:
             continue
         psk = Psi[k]
-        if psk is None or getattr(psk, 'size', 0) == 0:
+        if psk is None or getattr(psk, "size", 0) == 0:
             continue
 
         if use_gpu:
+            # 关键：idxk/psk 必须是 cupy
             if not isinstance(idxk, cp.ndarray):
                 idxk = cp.asarray(idxk, dtype=cp.int32)
                 idxe_patch[k] = idxk
@@ -1181,6 +1191,13 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
             Psi[k] = psk
 
         xp.add.at(Psi_sum, idxk, psk)
+        if Psi_sum_feat is not None and fm[k]:
+            xp.add.at(Psi_sum_feat, idxk, psk)
+
+    tube_mask = None
+    if Psi_sum_feat is not None:
+        tau = out_dtype(feature_tube_tau)
+        tube_mask = Psi_sum_feat > tau  # xp bool
 
     # 2) 累计加权后的 potential
     temp = xp.zeros(m, dtype=out_dtype)
@@ -1188,26 +1205,101 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
 
     for k in range(M):
         idxk = idxe_patch[k]
-        if idxk is None or getattr(idxk, 'size', 0) == 0:
+        if idxk is None or getattr(idxk, "size", 0) == 0:
             continue
         psk = Psi[k]
-        if psk is None or getattr(psk, 'size', 0) == 0:
+        if psk is None or getattr(psk, "size", 0) == 0:
             continue
         potk = potential_local[k]
-        if potk is None or getattr(potk, 'size', 0) == 0:
+        if potk is None or getattr(potk, "size", 0) == 0:
             continue
 
-        if use_gpu and not isinstance(potk, cp.ndarray):
-            potk = cp.asarray(potk, dtype=out_dtype)
-            potential_local[k] = potk
+        # 关键：potk 也必须跟 xp 一致
+        if use_gpu:
+            if not isinstance(potk, cp.ndarray):
+                potk = cp.asarray(potk, dtype=out_dtype)
+                potential_local[k] = potk
+        else:
+            if not isinstance(potk, np.ndarray):
+                potk = np.asarray(potk, dtype=out_dtype)
+                potential_local[k] = potk
 
-        denom = xp.maximum(Psi_sum[idxk], eps)
-        w = psk / denom
+        if tube_mask is not None:
+            tm = tube_mask[idxk]  # xp bool
+            if fm[k]:
+                # feature patch：tube 内用 Psi_sum_feat 归一化；tube 外仍用 Psi_sum
+                denom = xp.where(tm, Psi_sum_feat[idxk], Psi_sum[idxk])
+                denom = xp.maximum(denom, eps)
+                w = psk / denom
+            else:
+                # smooth patch：tube 内直接屏蔽（权重=0）
+                denom = xp.maximum(Psi_sum[idxk], eps)
+                w = psk / denom
+                w = w * (~tm).astype(out_dtype)
+        else:
+            denom = xp.maximum(Psi_sum[idxk], eps)
+            w = psk / denom
+
         xp.add.at(temp, idxk, potk * w)
 
     potential = xp.full(m, xp.nan, dtype=out_dtype)
+    # ===== 全局场组装：temp 已经是 Σ potk*(Psi/Psi_sum) 的结果，不要再除 Psi_sum =====
     mask = Psi_sum > 0
-    potential[mask] = temp[mask]
+
+    if xp.any(mask):
+        potential = temp.astype(out_dtype, copy=False)
+
+        # outside 幅值：max|.| + 1，确保远离 0
+        vals = potential[mask]
+        absmax = xp.max(xp.abs(vals))
+        A = absmax + out_dtype(1.0)
+        A = xp.where(A == 0, out_dtype(1.0), A)
+
+        # outside 符号：优先用边界已覆盖样本的平均符号；若边界无覆盖则用 median 符号
+        pot3 = potential.reshape((mmy, mmx, mmz), order='F')
+        msk3 = mask.reshape((mmy, mmx, mmz), order='F')
+
+        s = out_dtype(0.0)
+        c = out_dtype(0.0)
+
+        def _acc(v_plane, m_plane):
+            nonlocal s, c
+            mf = m_plane & xp.isfinite(v_plane)
+            if xp.any(mf):
+                s = s + xp.sum(v_plane[mf], dtype=out_dtype)
+                c = c + xp.sum(mf, dtype=out_dtype)
+
+        _acc(pot3[0, :, :],  msk3[0, :, :])
+        _acc(pot3[-1, :, :], msk3[-1, :, :])
+        _acc(pot3[:, 0, :],  msk3[:, 0, :])
+        _acc(pot3[:, -1, :], msk3[:, -1, :])
+        _acc(pot3[:, :, 0],  msk3[:, :, 0])
+        _acc(pot3[:, :, -1], msk3[:, :, -1])
+
+        # cupy 标量转 float 的兼容
+        if use_gpu:
+            c_host = float(cp.asnumpy(c))
+        else:
+            c_host = float(c)
+
+        if c_host > 0.0:
+            outside_sign = xp.sign(s)
+        else:
+            outside_sign = xp.sign(xp.median(vals))
+
+        outside_sign = xp.where(outside_sign == 0, out_dtype(1.0), outside_sign)
+        outside_val = outside_sign * A
+
+        potential = potential.copy()
+        potential[~mask] = outside_val
+
+        # 关键：对全域做兜底（包括 mask 内部可能来自局部求解的 NaN/Inf）
+        potential = xp.nan_to_num(potential, nan=outside_val, posinf=outside_val, neginf=-outside_val)
+
+    else:
+        outside_val = out_dtype(1.0)
+        potential = xp.full(m, outside_val, dtype=out_dtype)
+
     potential = potential.reshape((mmy, mmx, mmz), order='F')
     if use_gpu:
         potential = cp.asnumpy(potential)
@@ -1215,12 +1307,20 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
     X = X * scale + minxx[0]
     Y = Y * scale + minxx[1]
     Z = Z * scale + minxx[2]
+
     if progress_stage is not None:
         try:
             progress_stage('加权-完成', None)
         except Exception:
             pass
+
+
+    print("[check] nan:", int(np.isnan(potential).sum()),
+        "inf:", int(np.isinf(potential).sum()),
+        "finite_ratio:", float(np.isfinite(potential).mean()))
+
     return potential, X, Y, Z
+# =============================================================================
 
 
 # ===== 模块导出 =====
