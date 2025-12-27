@@ -121,72 +121,6 @@ def export_sharp_curve_constraints(
     if scale <= 0:
         scale = 1.0
 
-    # === [新增代码开始] 检测是否已有 B1 曲线文件，有则复用 ===
-    raw_path = os.path.join(out_dir, "sharp_curve_points_raw.npy")
-    tan_path = os.path.join(out_dir, "sharp_curve_tangents.npy")
-    reuse_existing = (os.path.exists(raw_path) and os.path.exists(tan_path))
-
-    if reuse_existing:
-        try:
-            print(f"[sharp-curve] Detect existing curve files at {out_dir}, REUSING...")
-            curve_pts = np.load(raw_path)
-            if curve_pts.ndim != 2 or curve_pts.shape[1] != 3:
-                raise ValueError(f"Existing curve shape invalid: {curve_pts.shape}")
-
-            # 1. 使用当前的 minxx/scale 重算 unit 坐标
-            curve_unit = (curve_pts - minxx) / scale
-            np.save(os.path.join(out_dir, "sharp_curve_points_unit.npy"), curve_unit)
-
-            # 2. 确保 group_id 存在
-            gid_path = os.path.join(out_dir, "sharp_curve_group_id.npy")
-            if not os.path.exists(gid_path):
-                np.save(gid_path, np.zeros((curve_pts.shape[0],), dtype=np.int32))
-
-            # 3. 更新 Meta
-            meta = {
-                "n_points": int(curve_pts.shape[0]),
-                "minxx": minxx.tolist(),
-                "scale": float(scale),
-                "source": "reuse-existing-raw(+tangent+n1+n2), unit recomputed from nodes.txt"
-            }
-            with open(os.path.join(out_dir, "sharp_curve_meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
-
-            # 4. 重新计算 Patch 映射 (Feature Patch -> Curve Indices)
-            if os.path.exists(patches_path) and os.path.exists(radii_path):
-                try:
-                    patches = np.loadtxt(patches_path)
-                    radii = np.loadtxt(radii_path)
-                    # 尝试读取 feature count，没有则默认全部
-                    f_count = patches.shape[0]
-                    if os.path.exists(os.path.join(out_dir, "sharp_feature_count.txt")):
-                         with open(os.path.join(out_dir, "sharp_feature_count.txt"), 'r') as f:
-                             f_count = int(f.read().strip())
-                    
-                    f_count = min(f_count, patches.shape[0])
-                    
-                    if f_count > 0:
-                        patches_unit = (patches[:f_count] - minxx) / scale
-                        radii_unit = radii[:f_count] / scale
-                        tree = cKDTree(curve_unit)
-                        mapping = {}
-                        for i in range(f_count):
-                            idx = tree.query_ball_point(patches_unit[i], float(radii_unit[i]))
-                            if idx:
-                                # json key 必须是 string
-                                if isinstance(idx, int): idx = [idx]
-                                mapping[str(i)] = [int(j) for j in idx]
-                        
-                        with open(os.path.join(out_dir, "sharp_curve_feature_patch_map.json"), "w") as f:
-                            json.dump(mapping, f, indent=2)
-                except Exception as e:
-                    print(f"[sharp-curve] Warning: Failed to compute patch mapping: {e}")
-
-            return  # <--- 重要：直接返回，不再执行后续重采样
-        except Exception as e:
-            print(f"[sharp-curve] Reuse failed ({e}), falling back to resampling.")
-    # === [新增代码结束] ===
-
     read_mesh, detect_sharp_edges, detect_sharp_junctions_degree, build_sharp_segments = _import_sharp_tools()
     mesh = read_mesh(input_mesh_path, compute_split_normals=False)
 
@@ -355,6 +289,22 @@ def main():
     ap.add_argument('--max_curve_points_per_feature_patch', type=int, default=200,
                     help='输出 feature patch 映射时，每个 feature patch 最多保留多少个曲线点（默认 200，防止后续 exactinterp 系统过大）')
 
+    # --- 新增：导出椭球(各向异性)patch信息（patch_frames/patch_axes） ---
+    ap.add_argument('--export_patch_aniso', action='store_true',
+                    help='导出 patch_frames.npy / patch_axes.npy（用于各向异性椭球patch）；默认不导出')
+    ap.add_argument('--aniso_ratio_feature', type=float, default=0.25,
+                    help='feature patch 的法向半轴比例 c/a（默认 0.25）')
+    ap.add_argument('--aniso_ratio_smooth', type=float, default=0.75,
+                    help='smooth patch 的法向半轴比例 c/a（默认 0.75）')
+    ap.add_argument('--aniso_k_nn', type=int, default=60,
+                    help='估计patch局部PCA时kNN兜底点数（默认 60）')
+    ap.add_argument('--aniso_min_points', type=int, default=20,
+                    help='估计patch局部PCA所需最少点数（默认 20）')
+    ap.add_argument('--aniso_ball_factor', type=float, default=1.0,
+                    help='估计patch帧时球邻域半径因子（默认 1.0，使用 r*factor）')
+
+
+
     args = ap.parse_args()
     inputs = args.inputs
     if not inputs:
@@ -378,6 +328,14 @@ def main():
 
     build_cfpu_input = _get_builder()
 
+    # 可选：导出椭球patch帧/半轴（用于各向异性patch）
+    export_patch_aniso_info = None
+    if getattr(args, "export_patch_aniso", False):
+        try:
+            from src.aniso_patch_export import export_patch_aniso_info  # type: ignore
+        except Exception:
+            from aniso_patch_export import export_patch_aniso_info  # type: ignore
+
     for inp in inputs:
         base = os.path.splitext(os.path.basename(inp))[0]
         out_dir = os.path.join(args.out_root, base + '_cfpu_input')
@@ -393,6 +351,21 @@ def main():
             args.require_step_face_id_diff
         )
 
+
+        # 1.5) （可选）导出各向异性椭球 patch 信息：patch_frames.npy / patch_axes.npy
+        if args.export_patch_aniso:
+            try:
+                from src.aniso_patch_export import export_patch_aniso_info
+            except Exception:
+                from aniso_patch_export import export_patch_aniso_info
+            export_patch_aniso_info(
+                output_dir=out_dir,
+                ratio_feature=args.aniso_ratio_feature,
+                ratio_smooth=args.aniso_ratio_smooth,
+                k_nn=args.aniso_k_nn,
+                min_points=args.aniso_min_points,
+                ball_factor=args.aniso_ball_factor,
+            )
         # 2) 导出尖锐边曲线约束点（做法A要用）
         if not args.no_export_sharp_curve:
             export_sharp_curve_constraints(

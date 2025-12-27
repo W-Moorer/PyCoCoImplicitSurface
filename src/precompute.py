@@ -1219,10 +1219,8 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = []
     curve_n1 = []
     curve_n2 = []
-    curve_is_convex = [] 
-    curve_edge_id = []
 
-    for _eid, e in enumerate(sharp_edges):
+    for e in sharp_edges:
         if not isinstance(e, dict):
             continue
         a = int(e['point1_idx'])
@@ -1248,8 +1246,6 @@ def export_sharp_curve_for_b1(output_dir: str,
             curve_tan.append(t)
             curve_n1.append(n1)
             curve_n2.append(n2)
-            curve_is_convex.append(bool(e.get('is_convex', False)))
-            curve_edge_id.append(int(e.get('edge_id', _eid)))
 
     if len(curve_pts) == 0:
         return
@@ -1258,8 +1254,6 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = np.asarray(curve_tan, dtype=float)
     curve_n1 = np.asarray(curve_n1, dtype=float)
     curve_n2 = np.asarray(curve_n2, dtype=float)
-    curve_is_convex = np.asarray(curve_is_convex, dtype=bool)
-    curve_edge_id = np.asarray(curve_edge_id, dtype=np.int32)
 
     # 去重（避免重复点导致后续奇异）
     q = max(sample_step * 0.25, 1e-12)
@@ -1270,8 +1264,6 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = curve_tan[uniq_idx]
     curve_n1 = curve_n1[uniq_idx]
     curve_n2 = curve_n2[uniq_idx]
-    curve_is_convex = curve_is_convex[uniq_idx]
-    curve_edge_id = curve_edge_id[uniq_idx]
 
     # 限制最大点数
     if curve_pts.shape[0] > max_points:
@@ -1280,15 +1272,11 @@ def export_sharp_curve_for_b1(output_dir: str,
         curve_tan = curve_tan[::stride]
         curve_n1 = curve_n1[::stride]
         curve_n2 = curve_n2[::stride]
-        curve_is_convex = curve_is_convex[::stride]
-        curve_edge_id = curve_edge_id[::stride]
 
     np.save(os.path.join(output_dir, "sharp_curve_points_raw.npy"), curve_pts)
     np.save(os.path.join(output_dir, "sharp_curve_tangents.npy"), curve_tan)
     np.save(os.path.join(output_dir, "sharp_curve_n1.npy"), curve_n1)
     np.save(os.path.join(output_dir, "sharp_curve_n2.npy"), curve_n2)
-    np.save(os.path.join(output_dir, "sharp_curve_is_convex.npy"), curve_is_convex.astype(np.int8))
-    np.save(os.path.join(output_dir, "sharp_curve_edge_id.npy"), curve_edge_id)
 
     meta_path = os.path.join(output_dir, "sharp_curve_meta.json")
     meta = {}
@@ -2134,3 +2122,160 @@ if __name__ == '__main__':
     print("precompute_single.py - 单文件整合版")
     print("包含模块: kdtree, mesh_io, topology, cfpu_input, segment")
     print("可用函数示例: read_mesh, face_segmentation, detect_sharp_edges, segment_mesh, build_cfpu_input")
+
+
+# ==============================
+# Anisotropic (ellipsoidal) patch support: export per-patch frames + axes
+# ==============================
+
+def _orthonormal_basis_from_normal(n: np.ndarray):
+    """Return (t1,t2,n) as an orthonormal right-handed basis given n."""
+    n = np.asarray(n, dtype=float)
+    nn = float(np.linalg.norm(n))
+    if nn < 1e-12:
+        n = np.array([0.0, 0.0, 1.0], dtype=float)
+    else:
+        n = n / nn
+    a = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(a, n))) > 0.9:
+        a = np.array([0.0, 1.0, 0.0], dtype=float)
+    t1 = np.cross(n, a)
+    t1n = float(np.linalg.norm(t1))
+    if t1n < 1e-12:
+        a = np.array([0.0, 0.0, 1.0], dtype=float)
+        t1 = np.cross(n, a)
+        t1n = float(np.linalg.norm(t1))
+    t1 = t1 / max(t1n, 1e-12)
+    t2 = np.cross(n, t1)
+    t2 = t2 / max(float(np.linalg.norm(t2)), 1e-12)
+    return t1, t2, n
+
+
+def export_patch_aniso_info(
+    output_dir: str,
+    nodes: np.ndarray,
+    normals: np.ndarray,
+    patches: np.ndarray,
+    radii: np.ndarray,
+    feature_count: int,
+    *,
+    aniso_ratio_feature: float = 0.25,
+    aniso_ratio_smooth: float = 0.75,
+    k_nn: int = 60,
+    min_points: int = 20,
+    max_ball_factor: float = 1.0,
+):
+    """
+    生成并落盘“椭球 patch”所需的几何信息（世界坐标）：
+      - patch_frames.npy: (M,3,3)  列向量为 [t1, t2, n]（右手系）
+      - patch_axes.npy:   (M,3)    半轴长度 (a,b,c)（世界坐标单位）
+      - patch_aniso_meta.json: 参数记录
+
+    估计方法（每个 patch）：
+      1) 在半径 r 的球邻域里抓取节点（不足则用 kNN 兜底）
+      2) n = normalize(平均法向)
+      3) 在切平面投影后做 PCA，取最大主方向为 t1，t2 = n×t1
+      4) a=b=r, c=r*ratio（feature/smooth 分别设 ratio）
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    nodes = np.asarray(nodes, dtype=float)
+    normals = np.asarray(normals, dtype=float)
+    patches = np.asarray(patches, dtype=float)
+    radii = np.asarray(radii, dtype=float).reshape(-1)
+
+    if patches.ndim != 2 or patches.shape[1] != 3:
+        raise ValueError(f"patches must be (M,3), got {patches.shape}")
+    if nodes.ndim != 2 or nodes.shape[1] != 3:
+        raise ValueError(f"nodes must be (N,3), got {nodes.shape}")
+    if normals.shape != nodes.shape:
+        raise ValueError(f"normals shape {normals.shape} != nodes shape {nodes.shape}")
+    if radii.shape[0] != patches.shape[0]:
+        raise ValueError(f"radii length {radii.shape[0]} != patches {patches.shape[0]}")
+
+    from scipy.spatial import cKDTree
+    tree = cKDTree(nodes)
+
+    M = patches.shape[0]
+    frames = np.zeros((M, 3, 3), dtype=np.float32)
+    axes = np.zeros((M, 3), dtype=np.float32)
+
+    fc = max(0, min(int(feature_count), M))
+
+    for i in range(M):
+        c = patches[i]
+        r = float(max(radii[i], 1e-12))
+        # 先用球邻域（可乘因子，和重建阶段的 aniso_query_factor 类似）
+        ids = tree.query_ball_point(c, r * float(max_ball_factor))
+        if ids is None:
+            ids = []
+        if len(ids) < int(min_points):
+            # kNN 兜底：至少保证有点来估计法向/主方向
+            kk = min(int(k_nn), nodes.shape[0])
+            d, idx = tree.query(c, k=kk)
+            idx = np.atleast_1d(idx).astype(int)
+            ids = idx.tolist()
+
+        pts = nodes[ids] - c.reshape(1, 3)
+        nr = normals[ids]
+
+        # mean normal
+        n_mean = np.sum(nr, axis=0)
+        nn = float(np.linalg.norm(n_mean))
+        if nn < 1e-12:
+            # fallback: take nearest node's normal
+            _, j = tree.query(c, k=1)
+            n_mean = normals[int(j)]
+            nn = float(np.linalg.norm(n_mean))
+        if nn < 1e-12:
+            n_mean = np.array([0.0, 0.0, 1.0], dtype=float)
+            nn = 1.0
+        n_mean = n_mean / nn
+
+        # project points onto tangent plane
+        proj = pts - (pts @ n_mean.reshape(3, 1)) * n_mean.reshape(1, 3)
+
+        # PCA on projected covariance
+        C = (proj.T @ proj) / max(1, proj.shape[0])
+        try:
+            w, V = np.linalg.eigh(C)
+            # largest eigenvector -> main tangent direction
+            t1 = V[:, int(np.argmax(w))]
+            t1n = float(np.linalg.norm(t1))
+            if t1n < 1e-12:
+                t1, t2, n_mean = _orthonormal_basis_from_normal(n_mean)
+            else:
+                t1 = t1 / t1n
+                # enforce orthogonal to n
+                t1 = t1 - float(np.dot(t1, n_mean)) * n_mean
+                t1 = t1 / max(float(np.linalg.norm(t1)), 1e-12)
+                t2 = np.cross(n_mean, t1)
+                t2 = t2 / max(float(np.linalg.norm(t2)), 1e-12)
+        except Exception:
+            t1, t2, n_mean = _orthonormal_basis_from_normal(n_mean)
+
+        # right-handed basis: [t1, t2, n]
+        frames[i, :, 0] = t1.astype(np.float32)
+        frames[i, :, 1] = t2.astype(np.float32)
+        frames[i, :, 2] = n_mean.astype(np.float32)
+
+        ratio = float(aniso_ratio_feature) if i < fc else float(aniso_ratio_smooth)
+        ratio = max(ratio, 1e-3)
+        a = r
+        b = r
+        caxis = r * ratio
+        axes[i] = np.array([a, b, caxis], dtype=np.float32)
+
+    np.save(os.path.join(output_dir, "patch_frames.npy"), frames)
+    np.save(os.path.join(output_dir, "patch_axes.npy"), axes)
+    meta = {
+        "aniso_ratio_feature": float(aniso_ratio_feature),
+        "aniso_ratio_smooth": float(aniso_ratio_smooth),
+        "k_nn": int(k_nn),
+        "min_points": int(min_points),
+        "max_ball_factor": float(max_ball_factor),
+        "note": "patch_frames columns are [t1,t2,n] in WORLD coords; patch_axes are (a,b,c) in WORLD units."
+    }
+    with open(os.path.join(output_dir, "patch_aniso_meta.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return frames, axes

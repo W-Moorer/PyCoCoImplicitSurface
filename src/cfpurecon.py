@@ -150,21 +150,33 @@ def weight(r, delta, k):
 
 _GLOBAL_X = None
 _GLOBAL_NRML = None
+_GLOBAL_CURVE = None
 
 def _init_proc(shm_name_x, shape_x, dtype_x,
-               shm_name_nrml, shape_nrml, dtype_nrml):
-    if SharedMemory is None: return
+               shm_name_nrml, shape_nrml, dtype_nrml,
+               shm_name_curve=None, shape_curve=None, dtype_curve=None):
+    if SharedMemory is None:
+        return
     shm_x = SharedMemory(name=shm_name_x)
     shm_nrml = SharedMemory(name=shm_name_nrml)
     import numpy as _np
-    global _GLOBAL_X, _GLOBAL_NRML, _SHM_X, _SHM_NRML
+    global _GLOBAL_X, _GLOBAL_NRML, _GLOBAL_CURVE, _SHM_X, _SHM_NRML, _SHM_CURVE
     _GLOBAL_X = _np.ndarray(shape_x, dtype=_np.dtype(dtype_x), buffer=shm_x.buf)
     _GLOBAL_NRML = _np.ndarray(shape_nrml, dtype=_np.dtype(dtype_nrml), buffer=shm_nrml.buf)
     _SHM_X = shm_x
     _SHM_NRML = shm_nrml
 
+    if shm_name_curve is not None:
+        shm_curve = SharedMemory(name=shm_name_curve)
+        _GLOBAL_CURVE = _np.ndarray(shape_curve, dtype=_np.dtype(dtype_curve), buffer=shm_curve.buf)
+        _SHM_CURVE = shm_curve
+    else:
+        _GLOBAL_CURVE = None
+        _SHM_CURVE = None
+
 def _compute_proc(args):
-    (k, idk, nn_dist_k,
+    # 新增 curve_idx_k：该 patch 对应的曲线点索引（在 _GLOBAL_CURVE 中）
+    (k, idk, curve_idx_k, nn_dist_k,
      y0, y1, y2, patchRad_k, order_k,
      exactinterp_k, nrmlreg_k, nrmllambda_k, nrmlschur_k,
      trbl_local, potreg_k, potlambda_k,
@@ -227,7 +239,7 @@ def _compute_proc(args):
     A[0:3*n, 3*n:] = CFP
     A[3*n:, 0:3*n] = CFPt
 
-    # 求解 curl-free 系数
+    # 求解 curl-free 系数（保持你原逻辑）
     if nrmlreg_k != 2:
         if nrmlreg_k == 1:
             A[0:3*n, 0:3*n] = A[0:3*n, 0:3*n] + 3*n*nrmllambda_k*np.eye(3*n)
@@ -286,55 +298,138 @@ def _compute_proc(args):
         axis=1
     ) + P @ coeffsp
 
-    # ===== residual correction：exact interpolation =====
+    # ===== residual correction：exact interpolation（做法A：节点 + 曲线点）=====
+    use_extended_centers = False
+    xx_corr = xx_local
+    xy_corr = xy_local
+    xz_corr = xz_local
+    corr_size = n
     coeffs_correction = None
 
     if exactinterp_k:
-        P0 = np.ones((n, 1))
-        A1 = np.ones((n+1, n+1))
-        A1[0:n, 0:n] = (-r if order_k == 1 else r**3)
-        A1[-1, -1] = 0.0
-        b1 = np.concatenate([temp_potential_nodes, np.array([0.0])])
+        curve_local = np.empty((0, 3), dtype=float)
+        if (_GLOBAL_CURVE is not None) and (curve_idx_k is not None) and (getattr(curve_idx_k, "size", 0) > 0):
+            curve_local = _GLOBAL_CURVE[np.asarray(curve_idx_k, dtype=int), :]
 
-        if potreg_k != 2:
-            if potreg_k == 1:
-                A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
-            elif potreg_k == 3:
-                if np.any(trbl_local):
-                    A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
-            try:
-                coeffs_correction = solve(A1, b1, assume_a='sym', check_finite=False)
-            except Exception:
-                A1[0:n, 0:n] = A1[0:n, 0:n] + n*1e-10*np.eye(n)
-                coeffs_correction = np.linalg.lstsq(A1, b1, rcond=None)[0]
+            # 去掉与节点重合的曲线点，避免重复中心导致奇异
+            if curve_local.shape[0] > 0:
+                dmin = cKDTree(x_local).query(curve_local, k=1)[0]
+                curve_local = curve_local[dmin > 1e-10]
+
+            # 去重
+            if curve_local.shape[0] > 1:
+                key = np.round(curve_local, decimals=10)
+                _, ui = np.unique(key, axis=0, return_index=True)
+                curve_local = curve_local[np.sort(ui)]
+
+        if curve_local.shape[0] > 0:
+            use_extended_centers = True
+            x_corr = np.vstack([x_local, curve_local])
+            xx_corr = x_corr[:, 0]
+            xy_corr = x_corr[:, 1]
+            xz_corr = x_corr[:, 2]
+            corr_size = x_corr.shape[0]
+
+            # 计算 s_m 在 x_corr 上的值（中心仍为 x_local）
+            dxc = x_corr[:, 0:1] - xx_local.reshape(1, -1)
+            dyc = x_corr[:, 1:2] - xy_local.reshape(1, -1)
+            dzc = x_corr[:, 2:3] - xz_local.reshape(1, -1)
+            rc = np.sqrt(dxc**2 + dyc**2 + dzc**2)
+            etac = (-rc if order_k == 1 else rc**3)
+            Pc = poly_P_xp(x_corr, order_k, np)
+            temp_potential_corr = np.sum(
+                etac * (dxc * coeffsx.reshape(1, -1) + dyc * coeffsy.reshape(1, -1) + dzc * coeffsz.reshape(1, -1)),
+                axis=1
+            ) + Pc @ coeffsp
+
+            # A1 用 x_corr 两两距离
+            dx2 = x_corr[:, 0:1] - x_corr[None, :, 0]
+            dy2 = x_corr[:, 1:2] - x_corr[None, :, 1]
+            dz2 = x_corr[:, 2:3] - x_corr[None, :, 2]
+            r2 = np.sqrt(dx2**2 + dy2**2 + dz2**2)
+            phi2 = (-r2 if order_k == 1 else r2**3)
+
+            A1 = np.ones((corr_size + 1, corr_size + 1))
+            A1[0:corr_size, 0:corr_size] = phi2
+            A1[-1, -1] = 0.0
+            b1 = np.concatenate([temp_potential_corr, np.array([0.0])])
+
+            if potreg_k != 2:
+                if potreg_k == 1:
+                    A1[0:corr_size, 0:corr_size] = A1[0:corr_size, 0:corr_size] + corr_size*potlambda_k*np.eye(corr_size)
+                elif potreg_k == 3:
+                    if np.any(trbl_local):
+                        A1[0:corr_size, 0:corr_size] = A1[0:corr_size, 0:corr_size] + corr_size*potlambda_k*np.eye(corr_size)
+
+                # 求解（增加容错，不改变正常情况）
+                try:
+                    coeffs_correction = solve(A1, b1, assume_a='sym', check_finite=False)
+                except Exception:
+                    A1[0:corr_size, 0:corr_size] = A1[0:corr_size, 0:corr_size] + corr_size*1e-10*np.eye(corr_size)
+                    coeffs_correction = np.linalg.lstsq(A1, b1, rcond=None)[0]
+            else:
+                # GCV 分支（用 corr_size）
+                P0 = np.ones((corr_size, 1))
+                Lc = P0.shape[1]
+                b2 = b1[0:corr_size]
+                A2 = A1[0:corr_size, 0:corr_size]
+                F1, G = qr(P0, mode='economic')
+                F2 = F1[:, Lc:]
+                F1 = F1[:, :Lc]
+                G1 = G[:Lc, :Lc]
+                w1 = F1.T @ b2
+                w2 = F2.T @ b2
+                L = cholesky(F2.T @ A2 @ F2)
+                U, D, _ = svd(L.T)
+                D = np.diag(D)
+                z2 = U.T @ w2
+                lam = fminbound(lambda t: gcv_cost_function(t, z2, D, 1.0/h2), -10, 35)
+                lam = (1.0/h2) * np.exp(-lam)
+                A2 = A2 + lam*np.eye(corr_size)
+                temp = F2 @ (U @ (z2 / (D**2 + lam)))
+                coeffs_correction = np.concatenate([temp, solve(G1, w1 - F1.T @ (A2 @ temp), check_finite=False)])
         else:
-            Lc = P0.shape[1]
-            b2 = b1[0:n]
-            A2 = A1[0:n, 0:n]
-            F1, G = qr(P0, mode='economic')
-            F2 = F1[:, Lc:]
-            F1 = F1[:, :Lc]
-            G1 = G[:Lc, :Lc]
-            w1 = F1.T @ b2
-            w2 = F2.T @ b2
-            L = cholesky(F2.T @ A2 @ F2)
-            U, D, _ = svd(L.T)
-            D = np.diag(D)
-            z2 = U.T @ w2
-            lam = fminbound(lambda t: gcv_cost_function(t, z2, D, 1.0/h2), -10, 35)
-            lam = (1.0/h2) * np.exp(-lam)
-            A2 = A2 + lam*np.eye(n)
-            temp = F2 @ (U @ (z2 / (D**2 + lam)))
-            coeffs_correction = np.concatenate([temp, solve(G1, w1 - F1.T @ (A2 @ temp), check_finite=False)])
+            # 无曲线点：完全走你原来的 nodes-only exact interpolation
+            P0 = np.ones((n, 1))
+            A1 = np.ones((n+1, n+1))
+            A1[0:n, 0:n] = (-r if order_k == 1 else r**3)
+            A1[-1, -1] = 0.0
+            b1 = np.concatenate([temp_potential_nodes, np.array([0.0])])
+            if potreg_k != 2:
+                if potreg_k == 1:
+                    A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
+                elif potreg_k == 3:
+                    if np.any(trbl_local):
+                        A1[0:n, 0:n] = A1[0:n, 0:n] + n*potlambda_k*np.eye(n)
+                coeffs_correction = solve(A1, b1, assume_a='sym', check_finite=False)
+            else:
+                Lc = P0.shape[1]
+                b2 = b1[0:n]
+                A2 = A1[0:n, 0:n]
+                F1, G = qr(P0, mode='economic')
+                F2 = F1[:, Lc:]
+                F1 = F1[:, :Lc]
+                G1 = G[:Lc, :Lc]
+                w1 = F1.T @ b2
+                w2 = F2.T @ b2
+                L = cholesky(F2.T @ A2 @ F2)
+                U, D, _ = svd(L.T)
+                D = np.diag(D)
+                z2 = U.T @ w2
+                lam = fminbound(lambda t: gcv_cost_function(t, z2, D, 1.0/h2), -10, 35)
+                lam = (1.0/h2) * np.exp(-lam)
+                A2 = A2 + lam*np.eye(n)
+                temp = F2 @ (U @ (z2 / (D**2 + lam)))
+                coeffs_correction = np.concatenate([temp, solve(G1, w1 - F1.T @ (A2 @ temp), check_finite=False)])
     else:
-        # 线性修正
+        # 线性修正（不变）
         P1 = np.hstack([P[:, 0:3], np.ones((n, 1))])
         coeffs_correction = np.linalg.lstsq(P1, temp_potential_nodes, rcond=None)[0]
 
     coeffs_correction_const = coeffs_correction[-1]
     coeffs_correction_vec = coeffs_correction[:-1]
 
-    # ===== patch 内网格点构建 =====
+    # ===== patch 内网格点构建（不变）=====
     ix = int(np.round((y0 - startx_k) / griddx_k)) + 1
     iy = int(np.round((y1 - starty_k) / griddx_k)) + 1
     iz = int(np.round((y2 - startz_k) / griddx_k)) + 1
@@ -378,6 +473,7 @@ def _compute_proc(args):
         idb = slice(j, min(j + batch_sz, mm))
         xe_local_batch = xe_local[idb, :]
 
+        # s_m 仍然相对 x_local（n）
         dxb = xe_local_batch[:, 0].reshape(-1, 1) - xx_local.reshape(1, -1)
         dyb = xe_local_batch[:, 1].reshape(-1, 1) - xy_local.reshape(1, -1)
         dzb = xe_local_batch[:, 2].reshape(-1, 1) - xz_local.reshape(1, -1)
@@ -395,8 +491,17 @@ def _compute_proc(args):
         ) + Pb @ coeffsp
 
         if exactinterp_k:
-            phib = (-rb if order_k == 1 else rb**3)
-            potential_correction[j:j+xe_local_batch.shape[0]] = phib @ coeffs_correction_vec + coeffs_correction_const
+            if use_extended_centers:
+                # correction 相对 x_corr（corr_size）
+                dxcg = xe_local_batch[:, 0].reshape(-1, 1) - xx_corr.reshape(1, -1)
+                dycg = xe_local_batch[:, 1].reshape(-1, 1) - xy_corr.reshape(1, -1)
+                dzcg = xe_local_batch[:, 2].reshape(-1, 1) - xz_corr.reshape(1, -1)
+                rcg = np.sqrt(dxcg**2 + dycg**2 + dzcg**2)
+                phicg = (-rcg if order_k == 1 else rcg**3)
+                potential_correction[j:j+xe_local_batch.shape[0]] = phicg @ coeffs_correction_vec + coeffs_correction_const
+            else:
+                phib = (-rb if order_k == 1 else rb**3)
+                potential_correction[j:j+xe_local_batch.shape[0]] = phib @ coeffs_correction_vec + coeffs_correction_const
         else:
             potential_correction[j:j+xe_local_batch.shape[0]] = Pb[:, 0:3] @ coeffs_correction_vec + coeffs_correction_const
 
@@ -478,14 +583,57 @@ def load_patch_radii_txt(radii_path, *, expected_len=None):
         raise ValueError(f"radii长度({radii.shape[0]})与expected_len({int(expected_len)})不一致: {radii_path}")
     return radii
 
+
+def load_patch_aniso_npy(aniso_dir, *, expected_len=None):
+    """从 aniso_dir 读取 patch_frames.npy / patch_axes.npy。"""
+    frames_path = os.path.join(aniso_dir, "patch_frames.npy")
+    axes_path = os.path.join(aniso_dir, "patch_axes.npy")
+    if (not os.path.isfile(frames_path)) or (not os.path.isfile(axes_path)):
+        raise FileNotFoundError(f"缺少 patch_frames.npy 或 patch_axes.npy: {frames_path} / {axes_path}")
+    frames = np.load(frames_path)
+    axes = np.load(axes_path)
+    frames = np.asarray(frames, dtype=float)
+    axes = np.asarray(axes, dtype=float).reshape(-1, 3)
+    if frames.ndim != 3 or frames.shape[1:] != (3, 3):
+        raise ValueError(f"patch_frames.npy 维度错误: {frames.shape}（应为 (M,3,3)）")
+    if expected_len is not None and frames.shape[0] != int(expected_len):
+        raise ValueError(f"patch_frames 数量({frames.shape[0]}) 与 patch 数量({int(expected_len)}) 不一致")
+    if expected_len is not None and axes.shape[0] != int(expected_len):
+        raise ValueError(f"patch_axes 数量({axes.shape[0]}) 与 patch 数量({int(expected_len)}) 不一致")
+    return frames, axes
+
+
+def ellipsoid_mask_points(dxyz, frame_cols, axes_abc):
+    """dxyz (K,3)，frame_cols (3,3) 列=[t1,t2,n]，axes=(a,b,c)，返回 (K,) bool mask: u<=1."""
+    a, b, c = float(axes_abc[0]), float(axes_abc[1]), float(axes_abc[2])
+    if a <= 0 or b <= 0 or c <= 0:
+        return np.zeros((dxyz.shape[0],), dtype=bool)
+    p = dxyz @ frame_cols  # local coords: [d·t1, d·t2, d·n]
+    u2 = (p[:, 0] / a) ** 2 + (p[:, 1] / b) ** 2 + (p[:, 2] / c) ** 2
+    return u2 <= 1.0
+
 def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
               progress=None, progress_stage=None,
               patch_radii=None, patch_radii_file=None,
               patch_radii_in_world_units=True, patch_radii_enforce_coverage=True,
               feature_mask=None, feature_scale=1.0, use_gpu=False,
-              feature_tube_blend=False, feature_tube_tau=0.0,
-              minxx_override=None, scale_override=None, return_transform=False
+              curve_points=None, curve_points_in_unit=False,
+              curve_patch_map=None, curve_max_points_per_patch=200,
+              curve_only_feature_patches=True,
+              feature_tube_blend=False,               feature_tube_tau=0.0,
+              # --- anisotropic (ellipsoidal) patches ---
+              anisotropic_patches=False,
+              aniso_dir=None,
+              patch_frames=None,
+              patch_axes=None,
+              patch_axes_in_world_units=True,
+              aniso_query_factor=1.2,
+              aniso_min_points=20,
+              aniso_max_iters=6,
+              aniso_expand=1.35,
+              aniso_allow_fallback_sphere=True
 ):
+
     if kernelinfo is None:
         kernelinfo = {
             'phi': lambda r: -r,
@@ -495,31 +643,44 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         }
     if reginfo is None:
         reginfo = {'exactinterp': 1}
-    if x.ndim != 2 or x.shape[1] != 3:
-        raise ValueError("x must be (N, 3)")
-
-    # === [修改开始] 支持 Override ===
-    if minxx_override is not None:
-        minxx = np.asarray(minxx_override, dtype=float)
-    else:
-        minxx = np.min(x, axis=0)
-
-    if scale_override is not None:
-        scale = float(scale_override)
-    else:
-        maxxx = np.max(x, axis=0)
-        scale = float(np.max(maxxx - minxx))
-        if scale <= 1e-8: scale = 1.0
-
-    x = (x - minxx) / scale
-    y = (y - minxx) / scale
-    # === [修改结束] ===
+    minxx = np.min(x, axis=0)
+    maxxx = np.max(x, axis=0)
+    x = x - minxx
+    scale = np.max(maxxx - minxx)
+    x = x / scale
+    y = y - minxx
+    y = y / scale
     M = y.shape[0]
     N = x.shape[0]
     delta = 1.0
 
     # GPU 开关：仅当用户请求且 CuPy/GPU 可用时启用
     use_gpu = bool(use_gpu and GPU_AVAILABLE)
+    # -------- 各向异性（椭球）patch：加载 frames/axes（若启用） --------
+    aniso_enabled = bool(anisotropic_patches)
+    aniso_frames = None
+    aniso_axes = None  # unit coords (after scaling)
+    if aniso_enabled:
+        if patch_frames is None or patch_axes is None:
+            if aniso_dir is None:
+                raise ValueError("anisotropic_patches=True 但未提供 aniso_dir 或 patch_frames/patch_axes")
+            patch_frames, patch_axes = load_patch_aniso_npy(aniso_dir, expected_len=M)
+
+        aniso_frames = np.asarray(patch_frames, dtype=float)
+        aniso_axes = np.asarray(patch_axes, dtype=float).reshape(-1, 3)
+        if aniso_frames.shape[0] != M or aniso_axes.shape[0] != M:
+            raise ValueError(f"aniso 数据数量不一致：frames={aniso_frames.shape[0]}, axes={aniso_axes.shape[0]}, M={M}")
+
+        if patch_axes_in_world_units:
+            aniso_axes = aniso_axes / float(scale)
+
+        # 对 feature patches 施加 feature_scale（缩放 a,b,c）
+        if feature_mask is not None and float(feature_scale) != 1.0:
+            fm_tmp = np.asarray(feature_mask, dtype=bool)[:M]
+            if np.any(fm_tmp):
+                aniso_axes[fm_tmp, :] = aniso_axes[fm_tmp, :] * float(feature_scale)
+
+        aniso_axes = np.maximum(aniso_axes, 1e-12)
 
     # -------- Patch 半径/覆盖策略（支持读取 radii.txt） --------
     # 说明：cfpurecon内部会把x/y缩放到单位盒；若radii来自precompute输出（世界坐标），需要按同样scale缩放。
@@ -599,6 +760,113 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
                     nn_dist_list.append(dists)
             patchRad = patch_radii_arr
             
+    # ===== 做法A：曲线约束（可选）=====
+    # curve_points: world坐标(默认) 或 unit box(若 curve_points_in_unit=True)
+    # curve_patch_map: dict，可直接用 main_1 输出的 sharp_curve_feature_patch_map.json
+    curve_scaled = None
+    curve_idx_list = None
+
+    if curve_points is not None:
+        curve_points = np.asarray(curve_points, dtype=float)
+        if curve_points.ndim == 2 and curve_points.shape[1] == 3 and curve_points.shape[0] > 0:
+            if curve_points_in_unit:
+                curve_scaled = curve_points
+            else:
+                curve_scaled = (curve_points - minxx) / scale
+
+            curve_idx_list = [np.empty((0,), dtype=int) for _ in range(M)]
+
+            if isinstance(curve_patch_map, dict) and len(curve_patch_map) > 0:
+                # 优先使用预计算映射（更快）
+                for kk in range(M):
+                    lst = curve_patch_map.get(str(kk), curve_patch_map.get(kk, []))
+                    curve_idx_list[kk] = np.asarray(lst, dtype=int)
+            else:
+                # 无映射时：按 patch 球域分配（默认只对 feature patch 生效）
+                tree_curve = cKDTree(curve_scaled)
+                fm = np.asarray(feature_mask, dtype=bool)[:M] if feature_mask is not None else None
+                cap = int(curve_max_points_per_patch) if (curve_max_points_per_patch is not None) else 0
+
+                for kk in range(M):
+                    if curve_only_feature_patches and (fm is not None) and (not fm[kk]):
+                        continue
+                    ids = tree_curve.query_ball_point(y[kk, :], float(patchRad[kk]))
+                    if cap > 0 and len(ids) > cap:
+                        ids = np.asarray(ids, dtype=int)
+                        d = np.linalg.norm(curve_scaled[ids, :] - y[kk, :], axis=1)
+                        ids = ids[np.argsort(d)[:cap]]
+                    curve_idx_list[kk] = np.asarray(ids, dtype=int)
+
+
+    # -------- 若启用各向异性 patch：用椭球过滤/重建每个 patch 的节点集合 idx --------
+    if aniso_enabled:
+        # 以 a(=axes[0]) 作为 patchRad（用于包围盒与 PU 归一化尺度）
+        patchRad = np.asarray(patchRad, dtype=float).reshape(-1)
+        patchRad = np.maximum(aniso_axes[:, 0].astype(float), 1e-12)
+
+        tree_x = cKDTree(x)
+        tree_y = cKDTree(y)
+
+        idx_new = []
+        nn_dist_list_new = []
+        nodeInPatch = np.zeros(N, dtype=bool)
+
+        qf = float(aniso_query_factor)
+        min_pts = int(aniso_min_points)
+        max_it = int(aniso_max_iters)
+        expand = float(aniso_expand)
+
+        for k in range(M):
+            a, b, c0 = float(aniso_axes[k, 0]), float(aniso_axes[k, 1]), float(aniso_axes[k, 2])
+            R = qf * max(a, b, c0)
+            cand = tree_x.query_ball_point(y[k, :], R)
+            if len(cand) == 0:
+                idx_new.append(np.array([], dtype=int))
+                nn_dist_list_new.append(np.array([], dtype=float))
+                continue
+
+            cand = np.asarray(cand, dtype=int)
+            d = x[cand, :] - y[k, :]
+            frame = aniso_frames[k, :, :]
+
+            c_eff = float(c0)
+            mask = None
+            for it in range(max_it + 1):
+                axes_eff = np.array([a, b, c_eff], dtype=float)
+                mask = ellipsoid_mask_points(d, frame, axes_eff)
+                if mask.sum() >= min_pts:
+                    break
+                if (c_eff >= a) or (it == max_it):
+                    break
+                c_eff = min(a, c_eff * expand)
+
+            ids = cand[mask] if mask is not None else np.array([], dtype=int)
+            if (ids.size < max(3, min(8, min_pts // 2))) and bool(aniso_allow_fallback_sphere):
+                ids = cand
+
+            idx_new.append(ids.astype(int))
+            if ids.size == 0:
+                nn_dist_list_new.append(np.array([], dtype=float))
+            else:
+                nn_dist_list_new.append(np.linalg.norm(x[ids, :] - y[k, :], axis=1))
+                nodeInPatch[ids] = True
+
+        # 覆盖兜底：把未覆盖点塞回最近 patch
+        missing = np.where(~nodeInPatch)[0]
+        if missing.size > 0:
+            nearest_patch = tree_y.query(x[missing, :], k=1)[1]
+            for node_id, pk in zip(missing.tolist(), nearest_patch.tolist()):
+                idx_new[pk] = np.unique(np.concatenate([idx_new[pk], np.array([node_id], dtype=int)]))
+            nn_dist_list_new = [
+                (np.linalg.norm(x[ids, :] - y[k, :], axis=1) if ids.size else np.array([], dtype=float))
+                for k, ids in enumerate(idx_new)
+            ]
+
+        idx = idx_new
+        nn_dist_list = nn_dist_list_new
+
+        # 强制 thread（process 模式无法共享 frames/axes）
+        os.environ["CFPU_PARALLEL"] = "thread"
     # -------- 生成网格/插值 --------
     exactinterp = reginfo.get('exactinterp', 1)
     nrmlreg = reginfo.get('nrmlreg', 0)
@@ -786,8 +1054,25 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         yyg = starty + (iys - 1) * griddx
         zzg = startz + (izs - 1) * griddx
         XX3, YY3, ZZ3 = np.meshgrid(xxg, yyg, zzg, indexing='xy')
-        De = (y[k, 0] - XX3)**2 + (y[k, 1] - YY3)**2 + (y[k, 2] - ZZ3)**2
-        idmask = De.reshape(-1) < patchRad[k]**2
+        if aniso_enabled:
+            # 椭球 mask：u(x) <= 1
+            yk0, yk1, yk2 = y[k, 0], y[k, 1], y[k, 2]
+            dX = XX3 - yk0
+            dY = YY3 - yk1
+            dZ = ZZ3 - yk2
+
+            frame = aniso_frames[k, :, :]
+            a, b, c = float(aniso_axes[k, 0]), float(aniso_axes[k, 1]), float(aniso_axes[k, 2])
+
+            p0 = dX * frame[0, 0] + dY * frame[1, 0] + dZ * frame[2, 0]
+            p1 = dX * frame[0, 1] + dY * frame[1, 1] + dZ * frame[2, 1]
+            p2 = dX * frame[0, 2] + dY * frame[1, 2] + dZ * frame[2, 2]
+
+            u2 = (p0 / a) ** 2 + (p1 / b) ** 2 + (p2 / c) ** 2
+            idmask = (u2.reshape(-1) <= 1.0)
+        else:
+            De = (y[k, 0] - XX3)**2 + (y[k, 1] - YY3)**2 + (y[k, 2] - ZZ3)**2
+            idmask = De.reshape(-1) < patchRad[k]**2
         ixs2 = np.repeat(ixs.reshape(1, -1), len(yyg), axis=0)
         ixs2 = np.repeat(ixs2[:, :, np.newaxis], len(zzg), axis=2)
         iys2 = np.repeat(iys.reshape(-1, 1), len(xxg), axis=1)
@@ -797,9 +1082,15 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         temp_idg = (iys2 + (ixs2 - 1) * mmy) + (izs2 - 1) * (mmx * mmy)
         temp_idg = temp_idg.reshape(-1)
         temp_idg = temp_idg[idmask] - 1
-        De = np.sqrt(De.reshape(-1)[idmask])
-        idxe_k = temp_idg.astype(int)
-        Psi_k = weight(De, patchRad[k], 0)
+        if aniso_enabled:
+            # 等效半径：r_eq = a * sqrt(u2)；用 weight(r_eq, delta=a)
+            De = (a * np.sqrt(u2.reshape(-1)[idmask])).astype(float)
+            idxe_k = temp_idg.astype(int)
+            Psi_k = weight(De, float(a), 0)
+        else:
+            De = np.sqrt(De.reshape(-1)[idmask])
+            idxe_k = temp_idg.astype(int)
+            Psi_k = weight(De, patchRad[k], 0)
         xe_local = np.vstack([XX3.reshape(-1), YY3.reshape(-1), ZZ3.reshape(-1)]).T
         xe_local = xe_local[idmask, :]
         mm = xe_local.shape[0]
@@ -902,11 +1193,16 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         try:
             ctx = get_context('spawn')
 
+            if curve_scaled is not None and getattr(curve_scaled, "size", 0) > 0:
+                shm_curve = SharedMemory(create=True, size=curve_scaled.nbytes)
+                np.ndarray(curve_scaled.shape, dtype=curve_scaled.dtype, buffer=shm_curve.buf)[:] = curve_scaled
+
             try:
                 ctx = get_context('spawn')
-                global _GLOBAL_X, _GLOBAL_NRML
+                global _GLOBAL_X, _GLOBAL_NRML, _GLOBAL_CURVE
                 _GLOBAL_X = None
                 _GLOBAL_NRML = None
+                _GLOBAL_CURVE = None
 
                 with ctx.Pool(
                     processes=workers,
@@ -914,10 +1210,14 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
                     initargs=(
                         shm_x.name, x.shape, x.dtype.str,
                         shm_nrml.name, nrml.shape, nrml.dtype.str,
+                        (shm_curve.name if shm_curve is not None else None),
+                        (curve_scaled.shape if shm_curve is not None else None),
+                        (curve_scaled.dtype.str if shm_curve is not None else None),
                     )
                 ) as pool:
                     arg_iter = (
                         (k, idx[k],
+                        (curve_idx_list[k] if curve_idx_list is not None else np.empty((0,), dtype=int)),
                         nn_dist_list[k],
                         y[k, 0], y[k, 1], y[k, 2],
                         patchRad[k], order, exactinterp, nrmlreg, nrmllambda, nrmlschur,
@@ -934,7 +1234,9 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
                             except Exception:
                                 pass
             finally:
-                pass
+                if shm_curve is not None:
+                    shm_curve.close()
+                    shm_curve.unlink()
 
         finally:
             shm_x.close()
@@ -1175,8 +1477,6 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         "inf:", int(np.isinf(potential).sum()),
         "finite_ratio:", float(np.isfinite(potential).mean()))
 
-    if return_transform:
-        return potential, X, Y, Z, {'minxx': minxx, 'scale': scale}
     return potential, X, Y, Z
 # =============================================================================
 
