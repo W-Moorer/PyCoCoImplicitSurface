@@ -1188,6 +1188,7 @@ def export_sharp_curve_for_b1(output_dir: str,
                              sharp_edges: list,
                              sample_step: float = None,
                              tol_ratio: float = 0.01,
+                             face_region_id: np.ndarray = None,
                              max_points: int = 50000):
     """
     落盘：
@@ -1219,8 +1220,11 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = []
     curve_n1 = []
     curve_n2 = []
+    curve_is_convex = [] 
+    curve_edge_id = []
+    curve_region_pair = []  # (r1,r2) per sample when face_region_id is provided
 
-    for e in sharp_edges:
+    for _eid, e in enumerate(sharp_edges):
         if not isinstance(e, dict):
             continue
         a = int(e['point1_idx'])
@@ -1238,6 +1242,17 @@ def export_sharp_curve_for_b1(output_dir: str,
         n1 = _safe_normalize(cell_normals[f1]) if (0 <= f1 < cell_normals.shape[0]) else np.array([0.0, 0.0, 1.0], dtype=float)
         n2 = _safe_normalize(cell_normals[f2]) if (0 <= f2 < cell_normals.shape[0]) else n1.copy()
 
+        # Optional: record which two face-regions this sharp edge separates
+        r1 = r2 = -1
+        if face_region_id is not None:
+            try:
+                if 0 <= f1 < face_region_id.shape[0]:
+                    r1 = int(face_region_id[f1])
+                if 0 <= f2 < face_region_id.shape[0]:
+                    r2 = int(face_region_id[f2])
+            except Exception:
+                r1 = r2 = -1
+
         m = max(2, int(np.ceil(L / sample_step)) + 1)
         ts = np.linspace(0.0, 1.0, m, dtype=float)
         for s in ts:
@@ -1246,6 +1261,9 @@ def export_sharp_curve_for_b1(output_dir: str,
             curve_tan.append(t)
             curve_n1.append(n1)
             curve_n2.append(n2)
+            curve_is_convex.append(bool(e.get('is_convex', False)))
+            curve_edge_id.append(int(e.get('edge_id', _eid)))
+            curve_region_pair.append((int(r1), int(r2)))
 
     if len(curve_pts) == 0:
         return
@@ -1254,6 +1272,9 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = np.asarray(curve_tan, dtype=float)
     curve_n1 = np.asarray(curve_n1, dtype=float)
     curve_n2 = np.asarray(curve_n2, dtype=float)
+    curve_is_convex = np.asarray(curve_is_convex, dtype=bool)
+    curve_edge_id = np.asarray(curve_edge_id, dtype=np.int32)
+    curve_region_pair = np.asarray(curve_region_pair, dtype=np.int32)
 
     # 去重（避免重复点导致后续奇异）
     q = max(sample_step * 0.25, 1e-12)
@@ -1264,6 +1285,9 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = curve_tan[uniq_idx]
     curve_n1 = curve_n1[uniq_idx]
     curve_n2 = curve_n2[uniq_idx]
+    curve_is_convex = curve_is_convex[uniq_idx]
+    curve_edge_id = curve_edge_id[uniq_idx]
+    curve_region_pair = curve_region_pair[uniq_idx]
 
     # 限制最大点数
     if curve_pts.shape[0] > max_points:
@@ -1272,11 +1296,19 @@ def export_sharp_curve_for_b1(output_dir: str,
         curve_tan = curve_tan[::stride]
         curve_n1 = curve_n1[::stride]
         curve_n2 = curve_n2[::stride]
+        curve_is_convex = curve_is_convex[::stride]
+        curve_edge_id = curve_edge_id[::stride]
+        curve_region_pair = curve_region_pair[::stride]
 
     np.save(os.path.join(output_dir, "sharp_curve_points_raw.npy"), curve_pts)
     np.save(os.path.join(output_dir, "sharp_curve_tangents.npy"), curve_tan)
     np.save(os.path.join(output_dir, "sharp_curve_n1.npy"), curve_n1)
     np.save(os.path.join(output_dir, "sharp_curve_n2.npy"), curve_n2)
+    np.save(os.path.join(output_dir, "sharp_curve_is_convex.npy"), curve_is_convex.astype(np.int8))
+    np.save(os.path.join(output_dir, "sharp_curve_edge_id.npy"), curve_edge_id)
+
+    if face_region_id is not None:
+        np.save(os.path.join(output_dir, "sharp_curve_region_pair.npy"), curve_region_pair)
 
     meta_path = os.path.join(output_dir, "sharp_curve_meta.json")
     meta = {}
@@ -1295,6 +1327,7 @@ def export_sharp_curve_for_b1(output_dir: str,
         "curve_sample_step": float(sample_step),
         "num_curve_points": int(curve_pts.shape[0]),
         "sharp_edges_count": int(len(sharp_edges)),
+        "has_region_pair": bool(face_region_id is not None),
         "note": "B1 requires sharp_Lmin to derive tol_geom; epsilon is derived later in main_3."
     })
     with open(meta_path, "w", encoding="utf-8") as f:
@@ -1680,6 +1713,61 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
             continue
         sharp_geo_edges.add((gA, gB) if gA < gB else (gB, gA))
 
+
+    # --- [Region tagging addon] 计算 face_region_id：沿 sharp edges 切开后的面连通分量 ---
+    # 说明：只新增标记文件，不改变原有 nodes/normals/patches/radii/feature_count 的生成逻辑
+    face_region_id = None
+    num_regions = 0
+    vertex_region_sets = None
+    try:
+        n_faces = faces.shape[0]
+        if n_faces > 0:
+            _parent = list(range(n_faces))
+
+            def _ffind(i):
+                while _parent[i] != i:
+                    _parent[i] = _parent[_parent[i]]
+                    i = _parent[i]
+                return i
+
+            def _funion(a, b):
+                ra, rb = _ffind(a), _ffind(b)
+                if ra != rb:
+                    _parent[ra] = rb
+
+            # 沿“非 sharp edge”的面邻接做 union
+            for edge_key, flist in edge_to_faces.items():
+                if len(flist) < 2:
+                    continue
+                if edge_key in sharp_geo_edges:
+                    continue
+                base = int(flist[0])
+                for other in flist[1:]:
+                    _funion(base, int(other))
+
+            root_to_id = {}
+            face_region_id = np.empty((n_faces,), dtype=np.int32)
+            for fid in range(n_faces):
+                r = _ffind(fid)
+                if r not in root_to_id:
+                    root_to_id[r] = len(root_to_id)
+                face_region_id[fid] = root_to_id[r]
+            num_regions = int(face_region_id.max()) + 1 if n_faces > 0 else 0
+
+            # 顶点所属 region 集合（用于标记 node/patch）
+            vertex_region_sets = [set() for _ in range(points.shape[0])]
+            for fid in range(n_faces):
+                rid = int(face_region_id[fid])
+                tri = faces[fid]
+                vertex_region_sets[int(tri[0])].add(rid)
+                vertex_region_sets[int(tri[1])].add(rid)
+                vertex_region_sets[int(tri[2])].add(rid)
+    except Exception as _e:
+        face_region_id = None
+        vertex_region_sets = None
+        num_regions = 0
+        print(f"[region] face_region_id compute failed: {_e}")
+
     # 5.0.0 顶点 -> incident sharp edge records（用于凸/凹投票）
     pid_to_incident_edges = collections.defaultdict(list)
     for e in sharp_edges:
@@ -1843,10 +1931,30 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
     new_nodes = []
     new_normals = []
 
+    # --- [Region tagging addon] 与 new_nodes/new_normals 对齐的标签（不影响原有输出） ---
+    node_origin_pid = []
+    node_local_group = []   # 非拆分点为 -1；拆分点为该 pid 的第 i 个 face-group
+    node_region_id = []     # 单一 region；若该点跨多个 region 则为 -1，详见 node_region_list
+    node_region_list = {}   # 仅记录 node_region_id==-1 的多 region 列表：{node_index: [r1,r2,...]}
+
     for pid in range(points.shape[0]):
         if pid not in split_pids:
             new_nodes.append(points[pid])
             new_normals.append(normals[pid])
+            # region 标签（不改变节点值）
+            node_origin_pid.append(int(pid))
+            node_local_group.append(-1)
+            if vertex_region_sets is not None:
+                rs = sorted(list(vertex_region_sets[int(pid)]))
+                if len(rs) == 1:
+                    node_region_id.append(int(rs[0]))
+                elif len(rs) > 1:
+                    node_region_id.append(-1)
+                    node_region_list[str(len(node_region_id)-1)] = [int(x) for x in rs]
+                else:
+                    node_region_id.append(-1)
+            else:
+                node_region_id.append(-1)
             continue
 
         v = points[pid]
@@ -1909,6 +2017,20 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
             p_new = v + inset_dist * d
             new_nodes.append(p_new)
             new_normals.append(n_i)
+            # region 标签（不改变节点值）
+            node_origin_pid.append(int(pid))
+            node_local_group.append(int(i))
+            if face_region_id is not None:
+                rs = sorted({int(face_region_id[int(fid)]) for fid in face_groups[i] if 0 <= int(fid) < face_region_id.shape[0]})
+                if len(rs) == 1:
+                    node_region_id.append(int(rs[0]))
+                elif len(rs) > 1:
+                    node_region_id.append(-1)
+                    node_region_list[str(len(node_region_id)-1)] = [int(x) for x in rs]
+                else:
+                    node_region_id.append(-1)
+            else:
+                node_region_id.append(-1)
 
     new_nodes = np.asarray(new_nodes, dtype=float)
     new_normals = np.asarray(new_normals, dtype=float)
@@ -2059,6 +2181,50 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
     except Exception:
         pass
 
+
+    # --- [Region tagging addon] 写出额外 region 标记文件（不改变原有输入文件） ---
+    try:
+        if face_region_id is not None:
+            np.save(os.path.join(output_dir, "face_region_id.npy"), face_region_id.astype(np.int32))
+        # nodes 对齐标签
+        if len(node_region_id) == len(nodes):
+            np.save(os.path.join(output_dir, "node_region_id.npy"), np.asarray(node_region_id, dtype=np.int32))
+            np.save(os.path.join(output_dir, "node_origin_pid.npy"), np.asarray(node_origin_pid, dtype=np.int32))
+            np.save(os.path.join(output_dir, "node_local_group.npy"), np.asarray(node_local_group, dtype=np.int32))
+            if node_region_list:
+                with open(os.path.join(output_dir, "node_region_list.json"), "w", encoding="utf-8") as f:
+                    json.dump(node_region_list, f, ensure_ascii=False, indent=2)
+
+        # patches 标签（sharp patches 可能跨多个 region，因此 patch_region_id 用 -1 + patch_region_list.json 记录多值）
+        if vertex_region_sets is not None:
+            patch_origin_pid = np.asarray(list(sharp_vertex_ids) + list(sampled_smooth_ids), dtype=np.int32)
+            np.save(os.path.join(output_dir, "patch_origin_pid.npy"), patch_origin_pid)
+
+            patch_region_id = np.full((patch_origin_pid.shape[0],), -1, dtype=np.int32)
+            patch_region_list = {}
+            for pi, pid0 in enumerate(patch_origin_pid.tolist()):
+                rs = sorted(list(vertex_region_sets[int(pid0)]))
+                if len(rs) == 1:
+                    patch_region_id[pi] = int(rs[0])
+                elif len(rs) > 1:
+                    patch_region_list[str(pi)] = [int(x) for x in rs]
+
+            np.save(os.path.join(output_dir, "patch_region_id.npy"), patch_region_id)
+            if patch_region_list:
+                with open(os.path.join(output_dir, "patch_region_list.json"), "w", encoding="utf-8") as f:
+                    json.dump(patch_region_list, f, ensure_ascii=False, indent=2)
+
+            # 轻量 meta，便于 sanity-check
+            meta = {
+                "num_regions": int(num_regions),
+                "note": "face_region_id: face connected-components after cutting along detected sharp edges; other files are additive and do not change original CFPU inputs."
+            }
+            with open(os.path.join(output_dir, "region_meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+    except Exception as _e:
+        print(f"[region] write region tags failed: {_e}")
+
+
     # --- B1 bump 修正：导出尖锐边采样（不影响原有流程） ---
     try:
         export_sharp_curve_for_b1(
@@ -2069,7 +2235,8 @@ def build_cfpu_input(input_path, output_dir, angle_threshold=30.0, r_small_facto
             cell_normals=cell_normals,
             sharp_edges=sharp_edges,
             sample_step=None,      # 默认 0.25*sharp_Lmin
-            tol_ratio=0.01         # 你的误差指标：1% Lmin（可在 main_3 用 --b1_tol_ratio 覆盖）
+            tol_ratio=0.01,         # 你的误差指标：1% Lmin（可在 main_3 用 --b1_tol_ratio 覆盖）
+            face_region_id=face_region_id
         )
     except Exception as _e:
         print(f"[B1] export_sharp_curve_for_b1 failed: {_e}")
@@ -2122,160 +2289,3 @@ if __name__ == '__main__':
     print("precompute_single.py - 单文件整合版")
     print("包含模块: kdtree, mesh_io, topology, cfpu_input, segment")
     print("可用函数示例: read_mesh, face_segmentation, detect_sharp_edges, segment_mesh, build_cfpu_input")
-
-
-# ==============================
-# Anisotropic (ellipsoidal) patch support: export per-patch frames + axes
-# ==============================
-
-def _orthonormal_basis_from_normal(n: np.ndarray):
-    """Return (t1,t2,n) as an orthonormal right-handed basis given n."""
-    n = np.asarray(n, dtype=float)
-    nn = float(np.linalg.norm(n))
-    if nn < 1e-12:
-        n = np.array([0.0, 0.0, 1.0], dtype=float)
-    else:
-        n = n / nn
-    a = np.array([1.0, 0.0, 0.0], dtype=float)
-    if abs(float(np.dot(a, n))) > 0.9:
-        a = np.array([0.0, 1.0, 0.0], dtype=float)
-    t1 = np.cross(n, a)
-    t1n = float(np.linalg.norm(t1))
-    if t1n < 1e-12:
-        a = np.array([0.0, 0.0, 1.0], dtype=float)
-        t1 = np.cross(n, a)
-        t1n = float(np.linalg.norm(t1))
-    t1 = t1 / max(t1n, 1e-12)
-    t2 = np.cross(n, t1)
-    t2 = t2 / max(float(np.linalg.norm(t2)), 1e-12)
-    return t1, t2, n
-
-
-def export_patch_aniso_info(
-    output_dir: str,
-    nodes: np.ndarray,
-    normals: np.ndarray,
-    patches: np.ndarray,
-    radii: np.ndarray,
-    feature_count: int,
-    *,
-    aniso_ratio_feature: float = 0.25,
-    aniso_ratio_smooth: float = 0.75,
-    k_nn: int = 60,
-    min_points: int = 20,
-    max_ball_factor: float = 1.0,
-):
-    """
-    生成并落盘“椭球 patch”所需的几何信息（世界坐标）：
-      - patch_frames.npy: (M,3,3)  列向量为 [t1, t2, n]（右手系）
-      - patch_axes.npy:   (M,3)    半轴长度 (a,b,c)（世界坐标单位）
-      - patch_aniso_meta.json: 参数记录
-
-    估计方法（每个 patch）：
-      1) 在半径 r 的球邻域里抓取节点（不足则用 kNN 兜底）
-      2) n = normalize(平均法向)
-      3) 在切平面投影后做 PCA，取最大主方向为 t1，t2 = n×t1
-      4) a=b=r, c=r*ratio（feature/smooth 分别设 ratio）
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    nodes = np.asarray(nodes, dtype=float)
-    normals = np.asarray(normals, dtype=float)
-    patches = np.asarray(patches, dtype=float)
-    radii = np.asarray(radii, dtype=float).reshape(-1)
-
-    if patches.ndim != 2 or patches.shape[1] != 3:
-        raise ValueError(f"patches must be (M,3), got {patches.shape}")
-    if nodes.ndim != 2 or nodes.shape[1] != 3:
-        raise ValueError(f"nodes must be (N,3), got {nodes.shape}")
-    if normals.shape != nodes.shape:
-        raise ValueError(f"normals shape {normals.shape} != nodes shape {nodes.shape}")
-    if radii.shape[0] != patches.shape[0]:
-        raise ValueError(f"radii length {radii.shape[0]} != patches {patches.shape[0]}")
-
-    from scipy.spatial import cKDTree
-    tree = cKDTree(nodes)
-
-    M = patches.shape[0]
-    frames = np.zeros((M, 3, 3), dtype=np.float32)
-    axes = np.zeros((M, 3), dtype=np.float32)
-
-    fc = max(0, min(int(feature_count), M))
-
-    for i in range(M):
-        c = patches[i]
-        r = float(max(radii[i], 1e-12))
-        # 先用球邻域（可乘因子，和重建阶段的 aniso_query_factor 类似）
-        ids = tree.query_ball_point(c, r * float(max_ball_factor))
-        if ids is None:
-            ids = []
-        if len(ids) < int(min_points):
-            # kNN 兜底：至少保证有点来估计法向/主方向
-            kk = min(int(k_nn), nodes.shape[0])
-            d, idx = tree.query(c, k=kk)
-            idx = np.atleast_1d(idx).astype(int)
-            ids = idx.tolist()
-
-        pts = nodes[ids] - c.reshape(1, 3)
-        nr = normals[ids]
-
-        # mean normal
-        n_mean = np.sum(nr, axis=0)
-        nn = float(np.linalg.norm(n_mean))
-        if nn < 1e-12:
-            # fallback: take nearest node's normal
-            _, j = tree.query(c, k=1)
-            n_mean = normals[int(j)]
-            nn = float(np.linalg.norm(n_mean))
-        if nn < 1e-12:
-            n_mean = np.array([0.0, 0.0, 1.0], dtype=float)
-            nn = 1.0
-        n_mean = n_mean / nn
-
-        # project points onto tangent plane
-        proj = pts - (pts @ n_mean.reshape(3, 1)) * n_mean.reshape(1, 3)
-
-        # PCA on projected covariance
-        C = (proj.T @ proj) / max(1, proj.shape[0])
-        try:
-            w, V = np.linalg.eigh(C)
-            # largest eigenvector -> main tangent direction
-            t1 = V[:, int(np.argmax(w))]
-            t1n = float(np.linalg.norm(t1))
-            if t1n < 1e-12:
-                t1, t2, n_mean = _orthonormal_basis_from_normal(n_mean)
-            else:
-                t1 = t1 / t1n
-                # enforce orthogonal to n
-                t1 = t1 - float(np.dot(t1, n_mean)) * n_mean
-                t1 = t1 / max(float(np.linalg.norm(t1)), 1e-12)
-                t2 = np.cross(n_mean, t1)
-                t2 = t2 / max(float(np.linalg.norm(t2)), 1e-12)
-        except Exception:
-            t1, t2, n_mean = _orthonormal_basis_from_normal(n_mean)
-
-        # right-handed basis: [t1, t2, n]
-        frames[i, :, 0] = t1.astype(np.float32)
-        frames[i, :, 1] = t2.astype(np.float32)
-        frames[i, :, 2] = n_mean.astype(np.float32)
-
-        ratio = float(aniso_ratio_feature) if i < fc else float(aniso_ratio_smooth)
-        ratio = max(ratio, 1e-3)
-        a = r
-        b = r
-        caxis = r * ratio
-        axes[i] = np.array([a, b, caxis], dtype=np.float32)
-
-    np.save(os.path.join(output_dir, "patch_frames.npy"), frames)
-    np.save(os.path.join(output_dir, "patch_axes.npy"), axes)
-    meta = {
-        "aniso_ratio_feature": float(aniso_ratio_feature),
-        "aniso_ratio_smooth": float(aniso_ratio_smooth),
-        "k_nn": int(k_nn),
-        "min_points": int(min_points),
-        "max_ball_factor": float(max_ball_factor),
-        "note": "patch_frames columns are [t1,t2,n] in WORLD coords; patch_axes are (a,b,c) in WORLD units."
-    }
-    with open(os.path.join(output_dir, "patch_aniso_meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    return frames, axes
