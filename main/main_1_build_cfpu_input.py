@@ -271,7 +271,7 @@ def main():
     ap.add_argument('--inputs', nargs='+')
     ap.add_argument('--out_root', default=os.path.join('output', 'cfpu_input'))
 
-    ap.add_argument('--angle_threshold', type=float, default=45.0)
+    ap.add_argument('--angle_threshold', type=float, default=40.0)
     ap.add_argument('--r_small_factor', type=float, default=0.5)
     ap.add_argument('--r_large_factor', type=float, default=3.0)
     ap.add_argument('--edge_split_threshold', type=float, default=None)
