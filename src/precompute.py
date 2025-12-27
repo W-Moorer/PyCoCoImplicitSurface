@@ -1219,8 +1219,10 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = []
     curve_n1 = []
     curve_n2 = []
+    curve_is_convex = [] 
+    curve_edge_id = []
 
-    for e in sharp_edges:
+    for _eid, e in enumerate(sharp_edges):
         if not isinstance(e, dict):
             continue
         a = int(e['point1_idx'])
@@ -1246,6 +1248,8 @@ def export_sharp_curve_for_b1(output_dir: str,
             curve_tan.append(t)
             curve_n1.append(n1)
             curve_n2.append(n2)
+            curve_is_convex.append(bool(e.get('is_convex', False)))
+            curve_edge_id.append(int(e.get('edge_id', _eid)))
 
     if len(curve_pts) == 0:
         return
@@ -1254,6 +1258,8 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = np.asarray(curve_tan, dtype=float)
     curve_n1 = np.asarray(curve_n1, dtype=float)
     curve_n2 = np.asarray(curve_n2, dtype=float)
+    curve_is_convex = np.asarray(curve_is_convex, dtype=bool)
+    curve_edge_id = np.asarray(curve_edge_id, dtype=np.int32)
 
     # 去重（避免重复点导致后续奇异）
     q = max(sample_step * 0.25, 1e-12)
@@ -1264,6 +1270,8 @@ def export_sharp_curve_for_b1(output_dir: str,
     curve_tan = curve_tan[uniq_idx]
     curve_n1 = curve_n1[uniq_idx]
     curve_n2 = curve_n2[uniq_idx]
+    curve_is_convex = curve_is_convex[uniq_idx]
+    curve_edge_id = curve_edge_id[uniq_idx]
 
     # 限制最大点数
     if curve_pts.shape[0] > max_points:
@@ -1272,11 +1280,15 @@ def export_sharp_curve_for_b1(output_dir: str,
         curve_tan = curve_tan[::stride]
         curve_n1 = curve_n1[::stride]
         curve_n2 = curve_n2[::stride]
+        curve_is_convex = curve_is_convex[::stride]
+        curve_edge_id = curve_edge_id[::stride]
 
     np.save(os.path.join(output_dir, "sharp_curve_points_raw.npy"), curve_pts)
     np.save(os.path.join(output_dir, "sharp_curve_tangents.npy"), curve_tan)
     np.save(os.path.join(output_dir, "sharp_curve_n1.npy"), curve_n1)
     np.save(os.path.join(output_dir, "sharp_curve_n2.npy"), curve_n2)
+    np.save(os.path.join(output_dir, "sharp_curve_is_convex.npy"), curve_is_convex.astype(np.int8))
+    np.save(os.path.join(output_dir, "sharp_curve_edge_id.npy"), curve_edge_id)
 
     meta_path = os.path.join(output_dir, "sharp_curve_meta.json")
     meta = {}

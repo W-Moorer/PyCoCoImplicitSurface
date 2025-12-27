@@ -591,7 +591,8 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
               curve_points=None, curve_points_in_unit=False,
               curve_patch_map=None, curve_max_points_per_patch=200,
               curve_only_feature_patches=True,
-              feature_tube_blend=False, feature_tube_tau=0.0
+              feature_tube_blend=False, feature_tube_tau=0.0,
+              minxx_override=None, scale_override=None, return_transform=False
 ):
     if kernelinfo is None:
         kernelinfo = {
@@ -602,13 +603,25 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         }
     if reginfo is None:
         reginfo = {'exactinterp': 1}
-    minxx = np.min(x, axis=0)
-    maxxx = np.max(x, axis=0)
-    x = x - minxx
-    scale = np.max(maxxx - minxx)
-    x = x / scale
-    y = y - minxx
-    y = y / scale
+    if x.ndim != 2 or x.shape[1] != 3:
+        raise ValueError("x must be (N, 3)")
+
+    # === [修改开始] 支持 Override ===
+    if minxx_override is not None:
+        minxx = np.asarray(minxx_override, dtype=float)
+    else:
+        minxx = np.min(x, axis=0)
+
+    if scale_override is not None:
+        scale = float(scale_override)
+    else:
+        maxxx = np.max(x, axis=0)
+        scale = float(np.max(maxxx - minxx))
+        if scale <= 1e-8: scale = 1.0
+
+    x = (x - minxx) / scale
+    y = (y - minxx) / scale
+    # === [修改结束] ===
     M = y.shape[0]
     N = x.shape[0]
     delta = 1.0
@@ -1319,6 +1332,8 @@ def cfpurecon(x, nrml, y, gridsize, kernelinfo=None, reginfo=None, n_jobs=None,
         "inf:", int(np.isinf(potential).sum()),
         "finite_ratio:", float(np.isfinite(potential).mean()))
 
+    if return_transform:
+        return potential, X, Y, Z, {'minxx': minxx, 'scale': scale}
     return potential, X, Y, Z
 # =============================================================================
 

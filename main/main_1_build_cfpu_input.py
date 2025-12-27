@@ -121,6 +121,72 @@ def export_sharp_curve_constraints(
     if scale <= 0:
         scale = 1.0
 
+    # === [新增代码开始] 检测是否已有 B1 曲线文件，有则复用 ===
+    raw_path = os.path.join(out_dir, "sharp_curve_points_raw.npy")
+    tan_path = os.path.join(out_dir, "sharp_curve_tangents.npy")
+    reuse_existing = (os.path.exists(raw_path) and os.path.exists(tan_path))
+
+    if reuse_existing:
+        try:
+            print(f"[sharp-curve] Detect existing curve files at {out_dir}, REUSING...")
+            curve_pts = np.load(raw_path)
+            if curve_pts.ndim != 2 or curve_pts.shape[1] != 3:
+                raise ValueError(f"Existing curve shape invalid: {curve_pts.shape}")
+
+            # 1. 使用当前的 minxx/scale 重算 unit 坐标
+            curve_unit = (curve_pts - minxx) / scale
+            np.save(os.path.join(out_dir, "sharp_curve_points_unit.npy"), curve_unit)
+
+            # 2. 确保 group_id 存在
+            gid_path = os.path.join(out_dir, "sharp_curve_group_id.npy")
+            if not os.path.exists(gid_path):
+                np.save(gid_path, np.zeros((curve_pts.shape[0],), dtype=np.int32))
+
+            # 3. 更新 Meta
+            meta = {
+                "n_points": int(curve_pts.shape[0]),
+                "minxx": minxx.tolist(),
+                "scale": float(scale),
+                "source": "reuse-existing-raw(+tangent+n1+n2), unit recomputed from nodes.txt"
+            }
+            with open(os.path.join(out_dir, "sharp_curve_meta.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+
+            # 4. 重新计算 Patch 映射 (Feature Patch -> Curve Indices)
+            if os.path.exists(patches_path) and os.path.exists(radii_path):
+                try:
+                    patches = np.loadtxt(patches_path)
+                    radii = np.loadtxt(radii_path)
+                    # 尝试读取 feature count，没有则默认全部
+                    f_count = patches.shape[0]
+                    if os.path.exists(os.path.join(out_dir, "sharp_feature_count.txt")):
+                         with open(os.path.join(out_dir, "sharp_feature_count.txt"), 'r') as f:
+                             f_count = int(f.read().strip())
+                    
+                    f_count = min(f_count, patches.shape[0])
+                    
+                    if f_count > 0:
+                        patches_unit = (patches[:f_count] - minxx) / scale
+                        radii_unit = radii[:f_count] / scale
+                        tree = cKDTree(curve_unit)
+                        mapping = {}
+                        for i in range(f_count):
+                            idx = tree.query_ball_point(patches_unit[i], float(radii_unit[i]))
+                            if idx:
+                                # json key 必须是 string
+                                if isinstance(idx, int): idx = [idx]
+                                mapping[str(i)] = [int(j) for j in idx]
+                        
+                        with open(os.path.join(out_dir, "sharp_curve_feature_patch_map.json"), "w") as f:
+                            json.dump(mapping, f, indent=2)
+                except Exception as e:
+                    print(f"[sharp-curve] Warning: Failed to compute patch mapping: {e}")
+
+            return  # <--- 重要：直接返回，不再执行后续重采样
+        except Exception as e:
+            print(f"[sharp-curve] Reuse failed ({e}), falling back to resampling.")
+    # === [新增代码结束] ===
+
     read_mesh, detect_sharp_edges, detect_sharp_junctions_degree, build_sharp_segments = _import_sharp_tools()
     mesh = read_mesh(input_mesh_path, compute_split_normals=False)
 
