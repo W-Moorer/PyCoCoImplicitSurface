@@ -44,7 +44,6 @@ def check_convexity_robust(p1, p2, n1, n2, c1, c2):
     """
     mid = (p1 + p2) * 0.5
     dist = np.dot(c2 - mid, n1)
-    # 为了防止数值噪音，可以加一个小阈值，或者结合双向判定
     return "convex" if dist < 0 else "concave"
 
 # ==============================================================================
@@ -275,7 +274,7 @@ def fit_and_resample_segment_advanced(segment_points_ids, mesh_points, step_size
 def compute_band_points_geometric(new_pts, new_tans, n1s, n2s, 
                                   t_raw, vert_ids_raw, u_new, 
                                   edge_map, cell_normals, face_centroids, 
-                                  mesh_points, offset):
+                                  mesh_points, offset, mesh_obj=None):
     """
     【核心改进】
     废弃全局投票，改用“凹凸性+另一侧法向”的局部几何约束。
@@ -328,28 +327,15 @@ def compute_band_points_geometric(new_pts, new_tans, n1s, n2s,
 
         # 3. 几何定向修正
         # Side 1 修正:
-        # 投影 N2 到 Side 1 平面: proj_n2 = N2 - (N2.N1)N1
-        # 但我们这里的 N1, N2 已经是正交化的 B 样条结果，直接用点积判断即可。
-        # 理想方向:
-        #   Convex: 指向 -N2 (投影后)
-        #   Concave: 指向 +N2 (投影后)
-        
-        # 计算 e1 与 n2 的对齐度
-        # 如果 Convex, e1 应该与 n2 夹角 > 90度 (dot < 0)
-        # 如果 Concave, e1 应该与 n2 夹角 < 90度 (dot > 0)
-        
         dot_1 = np.dot(e1, n2)
         
         flip_1 = 1.0
         if is_convex == "convex":
-            # 期望反向 (dot < 0)。如果 dot > 0，说明反了，需要翻转
             if dot_1 > 0: flip_1 = -1.0
         else:
-            # 期望同向 (dot > 0)。如果 dot < 0，说明反了
             if dot_1 < 0: flip_1 = -1.0
             
-        # Side 2 修正 (对称逻辑):
-        # Convex: e2 应该背离 n1 -> dot(e2, n1) < 0
+        # Side 2 修正:
         dot_2 = np.dot(e2, n1)
         
         flip_2 = 1.0
@@ -361,7 +347,66 @@ def compute_band_points_geometric(new_pts, new_tans, n1s, n2s,
         final_p1s.append(curr_p + offset * e1 * flip_1)
         final_p2s.append(curr_p + offset * e2 * flip_2)
 
-    return np.array(final_p1s), n1s, np.array(final_p2s), n2s, convexity_flags
+    final_p1s = np.array(final_p1s)
+    final_p2s = np.array(final_p2s)
+    
+    # 【新增】: 执行越界检测与修复
+    if mesh_obj is not None:
+        final_p1s, bad1 = validate_and_fix_points_batch(mesh_obj, cell_normals, final_p1s, n1s, new_pts)
+        final_p2s, bad2 = validate_and_fix_points_batch(mesh_obj, cell_normals, final_p2s, n2s, new_pts)
+        
+        n_bad = np.sum(bad1) + np.sum(bad2)
+        if n_bad > 0:
+            pass # 可以打印日志: print(f"Fixed {n_bad} out-of-bounds points.")
+
+    return final_p1s, n1s, final_p2s, n2s, convexity_flags
+
+# ==============================================================================
+# 5.5. 越界检测与修复 (Validate and Fix)
+# ==============================================================================
+def validate_and_fix_points_batch(mesh, cell_normals, candidates, expected_normals, fallback_points, threshold=0.5):
+    '''
+    批量验证点是否越界 (Out of Bounds Detection)
+    基于法向一致性校验: dot(expected, found) < threshold => Out of Bounds
+    
+    原理:
+    如果偏移点跑到了完全不同的面上(例如从顶面跑到了侧面), 
+    其最近邻面的法向量(Found)会与期望法向量(Expected/Start)发生剧烈偏转(接近垂直).
+    '''
+    if len(candidates) == 0:
+        return candidates, np.zeros(0, dtype=bool)
+
+    # 1. 寻找最近面索引
+    # find_closest_cell 返回的是 cell index
+    try:
+        cell_ids = mesh.find_closest_cell(candidates)
+    except AttributeError:
+        # 兼容旧版 PyVista 或某些特殊情况
+        print("Warning: find_closest_cell not available or failed. Skipping validation.")
+        return candidates, np.zeros(len(candidates), dtype=bool)
+    
+    # 2. 获取最近面的法向量
+    valid_mask = (cell_ids != -1)
+    
+    found_normals = np.zeros_like(candidates)
+    # 使用传入的 cell_normals 数组 (N_cells, 3)
+    if np.any(valid_mask):
+        found_normals[valid_mask] = cell_normals[cell_ids[valid_mask]]
+    
+    # 3. 计算点积 (Cosine similarity)
+    # expected_normals 是该点原本所属流形的法向 (Spline N1/N2)
+    dots = np.sum(expected_normals * found_normals, axis=1)
+    
+    # 4. 判定与修复
+    # Dot < Threshold (e.g. 0.5 for 60 degrees) => Severe mismatch (Cliff detected)
+    bad_mask = (dots < threshold) | (~valid_mask)
+    
+    fixed_points = candidates.copy()
+    # 策略: 回退到原始中心线 (fallback_points)
+    # 也可以尝试减小 Offset，但回退是最安全的做法，避免产生悬空几何
+    fixed_points[bad_mask] = fallback_points[bad_mask]
+    
+    return fixed_points, bad_mask
 
 # ==============================================================================
 # 6. 主程序
@@ -428,7 +473,8 @@ def main():
             pts, tans, smooth_n1, smooth_n2,
             t_raw, seg['vertices'], u_new,
             edge_map, cell_normals, face_centroids, 
-            mesh.points, args.offset
+            mesh.points, args.offset,
+            mesh_obj=mesh  # 传入 mesh 对象用于 KDTree 查询
         )
 
         n_cvx = flags.count("convex")
